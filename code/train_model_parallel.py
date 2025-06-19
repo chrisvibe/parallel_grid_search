@@ -10,7 +10,6 @@ import pandas as pd
 from tqdm import tqdm
 import threading
 from typing import Tuple, Callable, List, Dict, Any
-from projects.parallel_grid_search.code.parallel_utils import ComputeJobResourceManager
 from projects.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
 import sys
 
@@ -495,7 +494,7 @@ class ResourceAwareScheduler:
                         logger.info(f"Scheduled job {job.i}-{job.j}")
                     else:
                         # Put back in queue
-                        logger.warning(f"Failed to schedule job {job.i}-{job.j}")
+                        logger.debug(f"Failed to schedule job {job.i}-{job.j}")
                         self.job_queue.put(job)
                         time.sleep(1)  # Wait before retry
                 except queue.Empty:
@@ -644,6 +643,7 @@ def generic_parallel_grid_search(
     """
     
     # Create output directory
+    output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=False)
     
     # Save configuration if callback provided

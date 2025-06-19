@@ -2,28 +2,31 @@
 cpu + gpu work in parallel
 
 # Simple Linear Model Parallel Training Example
-
-This example demonstrates how to use the parallel grid search framework to train a simple PyTorch model on both CPU and GPU simultaneously.
+This example made by AI demonstrates how to use the parallel grid search framework to train a simple PyTorch model on both CPU and GPU simultaneously.
 
 ## What This Example Does
 
-- Creates a simple neural network with one hidden layer (linear → ReLU → linear)
-- Generates synthetic regression data
-- Runs a grid search over different hyperparameters:
+- **Proper Grid Search Integration**: Uses your `generic_parallel_grid_search` function
+- **JobInterface Implementation**: Creates `SimpleLinearJob` that inherits from `JobInterface`
+- **Simple Neural Network**: 2-layer network (linear → ReLU → linear) for regression
+- **Synthetic Data**: Generates regression data with controllable noise
+- **Parameter Grid**: Tests combinations of:
   - Learning rates: [0.001, 0.01, 0.1]
   - Hidden sizes: [32, 64, 128]
-  - Devices: ['cpu', 'cuda'] (if available)
-- Trains multiple configurations in parallel across CPU and GPU
-- Reports the best configuration and performance comparison
+  - Multiple samples per configuration for statistical reliability
+- **CPU + GPU Parallel**: Automatically utilizes both CPU and GPU through your framework
+- **Proper Logging**: Integrates with your logging system
+- **Results Processing**: Saves results and provides performance summaries
 
 ## Key Features
 
-✅ **Job-based Interface**: Uses the existing `Job` class structure
-✅ **CPU + GPU Parallel**: Automatically detects CUDA and runs jobs on both devices
-✅ **Simple Model**: Just a 2-layer neural network for easy understanding
-✅ **Synthetic Data**: No external data dependencies
-✅ **Performance Metrics**: Tracks training time and final loss
-✅ **Results Analysis**: Finds best hyperparameters and compares device performance
+✅ **Generic Grid Search**: Uses your actual `generic_parallel_grid_search` framework
+✅ **JobInterface Compliant**: Proper `_run()` method implementation with shared state
+✅ **Resource Management**: Configurable GPU/CPU memory and core allocation
+✅ **Statistical Sampling**: Multiple runs per configuration for robust results
+✅ **Automatic Device Detection**: Seamlessly uses available CPU and GPU resources
+✅ **Results Persistence**: Saves detailed results to CSV files
+✅ **Performance Analysis**: Compares device performance and finds best hyperparameters
 
 ## Requirements
 
@@ -42,58 +45,65 @@ python simple_example.py
 
 ### Expected Output
 ```
-=== Simple Linear Model Parallel Training Example ===
-CUDA available! Using devices: ['cpu', 'cuda']
-Created 18 parameter combinations
+=== Simple Linear Model Parallel Grid Search ===
+PyTorch version: 2.0.1
+CUDA available: True
+CUDA devices: 1
+  Device 0: NVIDIA RTX 4090
 
-Starting parallel execution...
-Starting job on cpu with lr=0.001, hidden_size=32
-Starting job on cuda with lr=0.001, hidden_size=32
+Starting parallel grid search...
+Created 9 parameter combinations
+
+[Worker logs showing parallel execution across CPU and GPU]
+
+=== Grid Search Results Summary ===
+Total jobs completed: 18
+
+Results by configuration:
+                loss                    accuracy              training_time
+               mean   std   min        mean   std   max        mean
+config                                                              
+1             0.0234 0.0012 0.0221     0.8456 0.0023 0.8478     1.23
+2             0.0198 0.0008 0.0189     0.8612 0.0015 0.8625     1.45
 ...
-Job completed on cpu: Loss=0.0234, Time=2.15s
-Job completed on cuda: Loss=0.0234, Time=0.87s
 
-=== Results Summary ===
-Total execution time: 12.45 seconds
-Completed 18 jobs
+Device performance:
+           training_time      
+                    mean count
+device                       
+cpu                 2.18    9
+cuda               0.89     9
 
-Best configuration:
-  Device: cuda
-  Learning Rate: 0.01
-  Hidden Size: 64
-  Final Loss: 0.018432
-  Training Time: 0.92s
-
-Device Performance:
-  Average CPU time: 2.18s
-  Average GPU time: 0.89s
-  GPU speedup: 2.45x
+Best configuration found:
+Loss: 0.018432
+Parameters: {'learning_rate': 0.01, 'hidden_size': 64, 'epochs': 50, ...}
 ```
 
 ## How It Works
 
-### 1. Job Definition
-Each training configuration is wrapped in a `SimpleLinearJob` that:
-- Inherits from the base `Job` class
-- Takes hyperparameters as input
-- Handles data generation, model creation, and training
-- Returns performance metrics
+### 1. Job Implementation (`SimpleLinearJob`)
+- **Inherits from `JobInterface`**: Proper integration with your framework
+- **`_run(device)` method**: Core training logic executed on assigned device
+- **Shared State Management**: Uses locks to safely update shared history and best parameters
+- **Resource Handling**: Manages data movement and model placement on CPU/GPU
 
-### 2. Parameter Grid
-The example creates all combinations of:
-- Learning rates × Hidden sizes × Available devices
+### 2. Parameter Grid Creation
+The `create_parameter_combinations()` function generates all combinations of:
+- Learning rates × Hidden sizes = 9 total configurations
+- Each configuration gets multiple samples for statistical reliability
 
-### 3. Parallel Execution
-Uses the `JobManager` to:
-- Submit all jobs to a worker pool
-- Execute CPU and GPU jobs simultaneously
-- Collect and aggregate results
+### 3. Generic Grid Search Integration
+Uses your `generic_parallel_grid_search()` function with:
+- **Job Factory**: Creates job instances with proper parameters
+- **Resource Allocation**: Configurable GPU/CPU memory and core limits
+- **Callbacks**: Custom config saving and results processing
+- **Parallel Execution**: Automatic CPU+GPU job distribution
 
-### 4. Results Analysis
-Compares configurations to find:
-- Best hyperparameters (lowest loss)
-- Device performance differences
-- Overall speedup from parallelization
+### 4. Results Processing
+- **CSV Export**: Detailed results saved for further analysis
+- **Statistical Summary**: Mean, std, min/max across samples
+- **Device Comparison**: Performance metrics by CPU vs GPU
+- **Best Configuration**: Automatically identifies optimal hyperparameters
 
 ## Extending This Example
 

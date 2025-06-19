@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple example demonstrating CPU+GPU parallel training using the job interface.
+Simple example demonstrating CPU+GPU parallel training using the generic grid search framework.
 This trains a single linear layer on synthetic data with different hyperparameters.
 """
 
@@ -9,66 +9,163 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, Callable
 import time
-import os
+import logging
+from pathlib import Path
+import pandas as pd
+from copy import deepcopy
 
-# Import the job interface from your existing code
-from code.parallel_utils import JobManager, Job
-from code.train_model_parallel import BaseTrainingJob
+# Import the grid search framework
+from train_model_parallel import generic_parallel_grid_search
+from parallel_utils import JobInterface
+
+logger = logging.getLogger(__name__)
+
+
+class SimpleLinearModel(nn.Module):
+    """Simple neural network for demonstration"""
+    
+    def __init__(self, input_size: int, hidden_size: int, output_size: int = 1):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_size)
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+
+class SyntheticDataset:
+    """Simple synthetic dataset for regression"""
+    
+    def __init__(self, n_samples=1000, n_features=10, noise=0.1, device='cpu'):
+        self.n_samples = n_samples
+        self.n_features = n_features
+        self.noise = noise
+        
+        # Generate data
+        self.X = torch.randn(n_samples, n_features)
+        # Simple linear relationship with noise
+        true_weights = torch.randn(n_features, 1)
+        self.y = self.X @ true_weights + noise * torch.randn(n_samples, 1)
+        
+        # Create data loader
+        dataset = torch.utils.data.TensorDataset(self.X, self.y)
+        self.dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=32, shuffle=True
+        )
+    
+    def to(self, device):
+        """Move dataset to device"""
+        self.X = self.X.to(device)
+        self.y = self.y.to(device)
+        # Recreate dataloader with moved data
+        dataset = torch.utils.data.TensorDataset(self.X, self.y)
+        self.dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=32, shuffle=True
+        )
+        return self
 
 
 @dataclass
-class SimpleLinearJob(Job):
-    """
-    A simple job that trains a linear model on synthetic data.
-    Demonstrates the job interface for CPU+GPU parallel execution.
-    """
+class SimpleParams:
+    """Parameter structure for the simple example"""
+    learning_rate: float = 0.01
+    hidden_size: int = 64
+    epochs: int = 50
+    batch_size: int = 32
+    n_samples: int = 1000
+    n_features: int = 10
+    noise: float = 0.1
+    seed: int = 42
+
+
+class SimpleLinearJob(JobInterface):
+    """Job implementation for simple linear model training"""
     
-    def __init__(self, params: Dict[str, Any]):
-        super().__init__(params)
-        self.learning_rate = params.get('learning_rate', 0.01)
-        self.batch_size = params.get('batch_size', 32)
-        self.epochs = params.get('epochs', 100)
-        self.hidden_size = params.get('hidden_size', 64)
-        self.device = params.get('device', 'cpu')
-        
-    def create_synthetic_data(self, n_samples=1000, n_features=10):
-        """Generate simple synthetic regression data"""
-        X = torch.randn(n_samples, n_features)
-        # Simple linear relationship with some noise
-        true_weights = torch.randn(n_features, 1)
-        y = X @ true_weights + 0.1 * torch.randn(n_samples, 1)
-        return X, y
+    def __init__(self, i: int, j: int, total_configs: int, total_samples: int, 
+                 shared: dict, locks: dict, params: SimpleParams):
+        super().__init__(i, j, total_configs, total_samples, shared, locks)
+        self.params = params
     
-    def create_model(self, input_size: int, output_size: int = 1):
-        """Create a simple linear model"""
-        return nn.Sequential(
-            nn.Linear(input_size, self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, output_size)
-        )
+    def _run(self, device):
+        """Run training job on specified device"""
+        logger.info(f"{self.get_log_prefix()} Starting on {device}")
+        
+        # Set seed for reproducibility
+        torch.manual_seed(self.params.seed)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(self.params.seed)
+        
+        start_time = time.time()
+        
+        # Create dataset
+        dataset = SyntheticDataset(
+            n_samples=self.params.n_samples,
+            n_features=self.params.n_features,
+            noise=self.params.noise,
+            device=device
+        ).to(device)
+        
+        # Create model
+        model = SimpleLinearModel(
+            input_size=self.params.n_features,
+            hidden_size=self.params.hidden_size
+        ).to(device)
+        
+        # Train model
+        final_loss, final_accuracy = self._train_model(model, dataset, device)
+        
+        training_time = time.time() - start_time
+        
+        # Create results
+        results = {
+            'loss': final_loss,
+            'accuracy': final_accuracy,  # For compatibility with framework
+            'training_time': training_time,
+            'device': str(device),
+            'params': {
+                'learning_rate': self.params.learning_rate,
+                'hidden_size': self.params.hidden_size,
+                'epochs': self.params.epochs
+            }
+        }
+        
+        logger.info(f"{self.get_log_prefix()} Completed: Loss={final_loss:.4f}, Time={training_time:.2f}s")
+        
+        # Update shared results (similar to BooleanReservoirJob)
+        with self.locks['history']:
+            self.shared['history'].append({
+                'config': self.i + 1,
+                'sample': self.j + 1,
+                'device': str(device),
+                **results,
+                'params': self.params.__dict__
+            })
+        
+        # Update best params if needed
+        with self.locks['best_params']:
+            if (self.shared['best_params']['loss'] is None or 
+                final_loss < self.shared['best_params']['loss']):
+                self.shared['best_params']['loss'] = final_loss
+                self.shared['best_params']['params'] = self.params
+        
+        return {'status': 'success', 'stats': results}
     
-    def train_model(self, model, X, y, device):
-        """Train the model and return final loss"""
-        model = model.to(device)
-        X, y = X.to(device), y.to(device)
-        
-        # Create data loader
-        dataset = torch.utils.data.TensorDataset(X, y)
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=True
-        )
-        
-        optimizer = optim.Adam(model.parameters(), lr=self.learning_rate)
+    def _train_model(self, model, dataset, device):
+        """Train the model and return metrics"""
+        optimizer = optim.Adam(model.parameters(), lr=self.params.learning_rate)
         criterion = nn.MSELoss()
         
         model.train()
         final_loss = 0
         
-        for epoch in range(self.epochs):
+        for epoch in range(self.params.epochs):
             epoch_loss = 0
-            for batch_X, batch_y in dataloader:
+            for batch_X, batch_y in dataset.dataloader:
                 optimizer.zero_grad()
                 predictions = model(batch_X)
                 loss = criterion(predictions, batch_y)
@@ -76,135 +173,188 @@ class SimpleLinearJob(Job):
                 optimizer.step()
                 epoch_loss += loss.item()
             
-            final_loss = epoch_loss / len(dataloader)
+            final_loss = epoch_loss / len(dataset.dataloader)
             
-            # Print progress every 20 epochs
+            # Log progress occasionally
             if (epoch + 1) % 20 == 0:
-                print(f"Device {device}, Epoch {epoch+1}/{self.epochs}, Loss: {final_loss:.4f}")
+                logger.debug(f"{self.get_log_prefix()} Epoch {epoch+1}/{self.params.epochs}, Loss: {final_loss:.4f}")
         
-        return final_loss
-    
-    def run(self):
-        """Execute the training job"""
-        print(f"Starting job on {self.device} with lr={self.learning_rate}, hidden_size={self.hidden_size}")
+        # Calculate "accuracy" (for framework compatibility - using R²)
+        model.eval()
+        with torch.no_grad():
+            all_predictions = []
+            all_targets = []
+            for batch_X, batch_y in dataset.dataloader:
+                pred = model(batch_X)
+                all_predictions.append(pred)
+                all_targets.append(batch_y)
+            
+            predictions = torch.cat(all_predictions, dim=0)
+            targets = torch.cat(all_targets, dim=0)
+            
+            # Calculate R² as "accuracy"
+            ss_res = torch.sum((targets - predictions) ** 2)
+            ss_tot = torch.sum((targets - torch.mean(targets)) ** 2)
+            r2 = 1 - (ss_res / ss_tot)
+            accuracy = max(0, r2.item())  # Ensure non-negative
         
-        start_time = time.time()
-        
-        # Generate data
-        X, y = self.create_synthetic_data()
-        
-        # Create model
-        model = self.create_model(X.shape[1])
-        
-        # Train model
-        final_loss = self.train_model(model, X, y, self.device)
-        
-        training_time = time.time() - start_time
-        
-        result = {
-            'device': self.device,
-            'learning_rate': self.learning_rate,
-            'hidden_size': self.hidden_size,
-            'batch_size': self.batch_size,
-            'final_loss': final_loss,
-            'training_time': training_time,
-            'epochs': self.epochs
-        }
-        
-        print(f"Job completed on {self.device}: Loss={final_loss:.4f}, Time={training_time:.2f}s")
-        return result
+        return final_loss, accuracy
 
 
-def create_parameter_grid():
-    """Create a simple parameter grid for demonstration"""
+def simple_job_factory(param_combinations):
+    """Factory function to create SimpleLinearJob instances"""
+    def create_job(i, j, total_configs, total_samples, shared, locks):
+        params = param_combinations[i]
+        # Create a copy with unique seed for this sample
+        params_copy = deepcopy(params)
+        params_copy.seed = params.seed + i * 1000 + j
+        
+        return SimpleLinearJob(
+            i=i, j=j,
+            total_configs=total_configs,
+            total_samples=total_samples,
+            shared=shared,
+            locks=locks,
+            params=params_copy
+        )
+    return create_job
+
+
+def create_parameter_combinations():
+    """Create parameter grid for demonstration"""
     learning_rates = [0.001, 0.01, 0.1]
     hidden_sizes = [32, 64, 128]
     
-    # Determine available devices
-    devices = ['cpu']
-    if torch.cuda.is_available():
-        devices.append('cuda')
-        print(f"CUDA available! Using devices: {devices}")
-    else:
-        print("CUDA not available. Using CPU only.")
-    
-    # Create parameter combinations
-    param_combinations = []
-    job_id = 0
-    
+    combinations = []
     for lr in learning_rates:
         for hidden_size in hidden_sizes:
-            for device in devices:
-                params = {
-                    'job_id': job_id,
-                    'learning_rate': lr,
-                    'hidden_size': hidden_size,
-                    'batch_size': 32,
-                    'epochs': 50,  # Reduced for demo
-                    'device': device
-                }
-                param_combinations.append(params)
-                job_id += 1
+            params = SimpleParams(
+                learning_rate=lr,
+                hidden_size=hidden_size,
+                epochs=50,
+                batch_size=32,
+                n_samples=1000,
+                n_features=10,
+                noise=0.1,
+                seed=42
+            )
+            combinations.append(params)
     
-    return param_combinations
+    return combinations
 
 
-def run_parallel_grid_search():
-    """Run the parallel grid search example"""
-    print("=== Simple Linear Model Parallel Training Example ===")
-    print("This example demonstrates CPU+GPU parallel training using the job interface.\n")
+def simple_parallel_grid_search(
+    output_path: str = "simple_grid_search_results",
+    samples_per_config: int = 3,
+    gpu_memory_per_job_gb: float = 0.5,
+    cpu_memory_per_job_gb: float = 1.0,
+    cpu_cores_per_job: int = 1
+):
+    """Run parallel grid search for simple linear model"""
     
-    # Create parameter grid
-    param_combinations = create_parameter_grid()
-    print(f"Created {len(param_combinations)} parameter combinations")
+    # Create parameter combinations
+    param_combinations = create_parameter_combinations()
+    logger.info(f"Created {len(param_combinations)} parameter combinations")
     
-    # Create jobs
-    jobs = [SimpleLinearJob(params) for params in param_combinations]
+    # Create job factory
+    factory = simple_job_factory(param_combinations)
     
-    # Run jobs in parallel
-    print("\nStarting parallel execution...")
-    job_manager = JobManager(max_workers=len(set(p['device'] for p in param_combinations)))
+    # Define callbacks
+    def save_config(output_path):
+        """Save configuration info"""
+        config_info = {
+            'total_configs': len(param_combinations),
+            'samples_per_config': samples_per_config,
+            'parameter_grid': [params.__dict__ for params in param_combinations]
+        }
+        
+        config_file = output_path / 'config.txt'
+        with open(config_file, 'w') as f:
+            f.write(f"Simple Linear Model Grid Search\n")
+            f.write(f"Total configurations: {config_info['total_configs']}\n")
+            f.write(f"Samples per configuration: {config_info['samples_per_config']}\n")
+            f.write(f"Total jobs: {config_info['total_configs'] * config_info['samples_per_config']}\n\n")
+            f.write("Parameter combinations:\n")
+            for i, params in enumerate(config_info['parameter_grid']):
+                f.write(f"Config {i+1}: {params}\n")
     
-    start_time = time.time()
-    results = job_manager.submit_jobs(jobs)
-    total_time = time.time() - start_time
+    def process_results(history, best_params, output_path):
+        """Process and save results"""
+        if history:
+            # Save detailed results
+            history_df = pd.DataFrame(history)
+            results_file = output_path / 'results.csv'
+            history_df.to_csv(results_file, index=False)
+            logger.info(f"Saved {len(history)} results to {results_file}")
+            
+            # Print summary
+            print("\n=== Grid Search Results Summary ===")
+            print(f"Total jobs completed: {len(history)}")
+            
+            # Group by configuration
+            config_summary = history_df.groupby('config').agg({
+                'loss': ['mean', 'std', 'min'],
+                'accuracy': ['mean', 'std', 'max'],
+                'training_time': ['mean']
+            }).round(4)
+            
+            print("\nResults by configuration:")
+            print(config_summary)
+            
+            # Device performance comparison
+            if 'device' in history_df.columns:
+                device_summary = history_df.groupby('device').agg({
+                    'training_time': ['mean', 'count']
+                }).round(2)
+                print(f"\nDevice performance:")
+                print(device_summary)
+        
+        if best_params and 'params' in best_params:
+            print(f"\nBest configuration found:")
+            print(f"Loss: {best_params['loss']:.6f}")
+            print(f"Parameters: {best_params['params'].__dict__}")
     
-    # Analyze results
-    print(f"\n=== Results Summary ===")
-    print(f"Total execution time: {total_time:.2f} seconds")
-    print(f"Completed {len(results)} jobs")
+    # Run the generic parallel grid search
+    logger.info("Starting parallel grid search...")
+    history, best_params = generic_parallel_grid_search(
+        job_factory=factory,
+        total_configs=len(param_combinations),
+        samples_per_config=samples_per_config,
+        output_path=output_path,
+        gpu_memory_per_job_gb=gpu_memory_per_job_gb,
+        cpu_memory_per_job_gb=cpu_memory_per_job_gb,
+        cpu_cores_per_job=cpu_cores_per_job,
+        save_config=save_config,
+        process_results=process_results
+    )
     
-    # Find best result
-    best_result = min(results, key=lambda x: x['final_loss'])
-    print(f"\nBest configuration:")
-    print(f"  Device: {best_result['device']}")
-    print(f"  Learning Rate: {best_result['learning_rate']}")
-    print(f"  Hidden Size: {best_result['hidden_size']}")
-    print(f"  Final Loss: {best_result['final_loss']:.6f}")
-    print(f"  Training Time: {best_result['training_time']:.2f}s")
-    
-    # Show device comparison
-    cpu_results = [r for r in results if r['device'] == 'cpu']
-    gpu_results = [r for r in results if r['device'] == 'cuda']
-    
-    if cpu_results and gpu_results:
-        avg_cpu_time = np.mean([r['training_time'] for r in cpu_results])
-        avg_gpu_time = np.mean([r['training_time'] for r in gpu_results])
-        speedup = avg_cpu_time / avg_gpu_time
-        print(f"\nDevice Performance:")
-        print(f"  Average CPU time: {avg_cpu_time:.2f}s")
-        print(f"  Average GPU time: {avg_gpu_time:.2f}s")
-        print(f"  GPU speedup: {speedup:.2f}x")
-    
-    return results
+    return history, best_params
 
 
 if __name__ == "__main__":
-    # Run the example
-    results = run_parallel_grid_search()
+    # Set up logging
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(process)d - %(filename)s - %(message)s',
+        stream=sys.stdout,
+        force=True
+    )
     
-    # Optionally save results
-    import json
-    with open('grid_search_results.json', 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved to grid_search_results.json")
+    # Check available devices
+    print("=== Simple Linear Model Parallel Grid Search ===")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA devices: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+    
+    # Run grid search
+    history, best_params = simple_parallel_grid_search(
+        output_path="simple_grid_search_results",
+        samples_per_config=2,  # Reduced for demo
+        gpu_memory_per_job_gb=0.5,
+        cpu_memory_per_job_gb=1.0,
+        cpu_cores_per_job=1
+    )
