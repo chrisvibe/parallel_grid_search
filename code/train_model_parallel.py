@@ -332,7 +332,7 @@ class LazyWorkerPool:
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
     
-    def __init__(self, resource_manager: ComputeJobResourceManager, initial_concurrency=1, scheduler_loop_delay =1):
+    def __init__(self, resource_manager: ComputeJobResourceManager, scheduler_loop_delay =1):
         # Control
         self.resource_manager = resource_manager
         self.running = False
@@ -352,7 +352,7 @@ class ResourceAwareScheduler:
         # Scaling parameters
         self.last_scaling_time = time.time()
         self.scaling_interval = 30  # seconds
-        self.target_concurrency = initial_concurrency
+        self.target_concurrency = max(1, self.resource_manager.cpu_manager.max_jobs // 3)
         self.job_buffer = int(round(self.target_concurrency / 2 + 0.5))
     
     @property
@@ -594,7 +594,7 @@ class ResourceAwareScheduler:
                     self.last_completed_count = self._adjust_concurrency()
                     last_concurrency_check = current_time
                     avg_completion_time = round(sum(self.job_completion_times) / len(self.job_completion_times))
-                    self.scaling_interval = min(max(10, avg_completion_time), 180)
+                    self.scaling_interval = min(max(1, avg_completion_time), 180)
 
                 if (self.jobs_in_queue == 0) and (self.jobs_in_flight == 0):
                     self.running = False
