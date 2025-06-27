@@ -223,7 +223,7 @@ class LazyWorkerPool:
         """Remove workers by sending shutdown signals to workers"""
         removed = 0
         for _ in range(min(count, self.get_total_workers)):
-            self.worker_job_queue.put(None)  # Shutdown signal
+            self.worker_job_queue.put(None, timeout=1)  # Shutdown signal
             removed += 1
         logger.info(f"Scaled down {removed} workers (busy: {self.get_busy_workers}, idle: {self.get_idle_workers}, total: {self.get_total_workers}, max: {self.max_workers}, job-device backlog: {self.backlog})")
         return removed
@@ -415,6 +415,7 @@ class ResourceAwareScheduler:
                     logger.warning("Scheduler thread did not terminate within timeout")
             except Exception as e:
                 logger.error(f"Error stopping scheduler thread: {e}")
+                raise
 
         # Clear references to managed objects
         self.shared = None
