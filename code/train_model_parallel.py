@@ -26,11 +26,12 @@ split into cpu and gpu queue since they may require different resources
 consider caching dataset names instead of dataset itself
 '''
 
-def worker_function(job_queue, result_queue, worker_stats, stats_lock):
+def worker_function(job_queue, result_queue, cores_per_job, worker_stats, stats_lock):
     """Worker with proper stat tracking"""
+    set_num_interop_threads(1)
+    set_num_threads(cores_per_job)
     p = psutil.Process()
     worker_registered = False
-    resources_limited = False
     try:
         # Register worker as idle
         with stats_lock:
@@ -60,14 +61,7 @@ def worker_function(job_queue, result_queue, worker_stats, stats_lock):
                 resources = job_data['resources']
                 resources_allocated = resources.get('resources_allocated', False)
                 device = resources['device']
-                cores_per_job = resources['cores_per_job']
 
-                if not resources_limited:
-                    # limit resources per process
-                    set_num_interop_threads(1)
-                    set_num_threads(cores_per_job)
-                    resources_limited = True
-                    
                 # Set process priority to prevent freezing and prioritized gpu jobs over cpu jobs
                 is_gpu = device.type == 'cuda'
                 try:
@@ -133,9 +127,10 @@ def worker_function(job_queue, result_queue, worker_stats, stats_lock):
 class LazyWorkerPool:
     """Simplified worker pool that creates workers on demand"""
 
-    def __init__(self, max_workers: int):
+    def __init__(self, max_workers: int, cores_per_job: int):
         mp.set_start_method('spawn', force=True)
         self.max_workers = max_workers
+        self.cores_per_job = cores_per_job
         self.worker_job_queue = Queue()
         self.result_queue = Queue()
 
@@ -208,7 +203,7 @@ class LazyWorkerPool:
                 # Create new worker with shared state
                 p = Process(
                     target=worker_function,
-                    args=(self.worker_job_queue, self.result_queue, self.worker_stats, self.stats_lock)
+                    args=(self.worker_job_queue, self.result_queue, self.cores_per_job, self.worker_stats, self.stats_lock)
                 )
                 p.start()
                 self.workers[p.pid] = p
@@ -229,14 +224,13 @@ class LazyWorkerPool:
         logger.info(f"Scaled down {removed} workers (busy: {self.get_busy_workers}, idle: {self.get_idle_workers}, total: {self.get_total_workers}, max: {self.max_workers}, job-device backlog: {self.backlog})")
         return removed
 
-    def submit_job(self, job, device, cores_per_job):
+    def submit_job(self, job, device):
         """Submit a job with pre-allocated device"""
         job_data = {
             'job': job,
             'resources': {
                 'resources_allocated': True,
                 'device': device, 
-                'cores_per_job': cores_per_job,
             },
         }
         self.worker_job_queue.put(job_data)
@@ -341,7 +335,7 @@ class ResourceAwareScheduler:
         self.scheduler_loop_delay = scheduler_loop_delay
         
         # Worker pool
-        self.worker_pool = LazyWorkerPool(max_workers=self.resource_manager.max_concurrent)
+        self.worker_pool = LazyWorkerPool(max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cpu_manager.cores_per_job)
         
         # Job tracking
         self.job_queue = Queue()
@@ -505,7 +499,7 @@ class ResourceAwareScheduler:
         if device is not None:
             try:
                 logger.debug(f"Scheduled job on device {device}")
-                self.worker_pool.submit_job(job, device, self.resource_manager.cpu_manager.cores_per_job)
+                self.worker_pool.submit_job(job, device)
                 
                 # Thundering herd prevention
                 delay = self._calculate_submission_delay()
