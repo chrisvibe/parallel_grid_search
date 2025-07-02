@@ -2,6 +2,7 @@ import time
 import psutil
 import pynvml
 import torch
+from torch.utils.data import Dataset
 from collections import defaultdict, deque
 from os import environ, sched_getaffinity, cpu_count
 import torch.multiprocessing as mp
@@ -52,6 +53,8 @@ class JobInterface(ABC):
         return f"Config: {config_str}, Sample: {sample_str}"
 
 
+
+
 class GenericJobGenerator:
     """Generic job generator that can create any type of job"""
     
@@ -63,18 +66,18 @@ class GenericJobGenerator:
         self.total_configs = total_configs
         self.samples_per_config = samples_per_config
 
-        mp_manager = mp.Manager()
+        self.mp_manager = mp.Manager()
         self.shared = {
-            'best_params': mp_manager.dict({'loss': None, 'params': None}),
-            'dataset_cache': mp_manager.dict(),
-            'dataset_scores': mp_manager.dict(),
-            'history': mp_manager.list(),
+            'best_params': self.mp_manager.dict({'loss': None, 'params': None}),
+            'dataset_cache': self.mp_manager.dict(),
+            'dataset_scores': self.mp_manager.dict(),
+            'history': self.mp_manager.list(),
         }
         self.locks = {
-            'best_params': mp_manager.Lock(),
-            'dataset_cache': mp_manager.Lock(),
-            'dataset_scores': mp_manager.Lock(),
-            'history': mp_manager.Lock(),
+            'best_params': self.mp_manager.Lock(),
+            'dataset_cache': self.mp_manager.Lock(),
+            'dataset_scores': self.mp_manager.Lock(),
+            'history': self.mp_manager.Lock(),
         }
     
     def __iter__(self):
@@ -91,6 +94,35 @@ class GenericJobGenerator:
     
     def __len__(self):
         return self.total_configs * self.samples_per_config
+
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        return False
+    
+    def cleanup(self):
+        """Clean up multiprocessing resources"""
+        try:
+            # Clear shared objects - use del or slice assignment for proxies
+            if 'history' in self.shared:
+                del self.shared['history'][:]  # Clear list proxy
+            if 'dataset_cache' in self.shared:
+                self.shared['dataset_cache'].clear()  # DictProxy does have clear()
+            if 'dataset_scores' in self.shared:
+                self.shared['dataset_scores'].clear()
+            
+            # Clear references
+            self.shared.clear()
+            self.locks.clear()
+            
+            # Shutdown the manager
+            if hasattr(self, 'mp_manager'):
+                self.mp_manager.shutdown()
+                
+        except Exception as e:
+            logger.error(f"Error during job generator cleanup: {e}")
 
 
 def grouped_bar_graph(values, width=32):

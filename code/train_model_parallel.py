@@ -23,6 +23,8 @@ not sure dataset_cache memory scheme is optimal
 reduce complexity / redundance + make more modular
 optimizer for scheduler to find settings that maximize throughput: type cpu/gpu, concurrency, number of cores, throughput
 split into cpu and gpu queue since they may require different resources
+use torch.multiprocessing.shared_memory_ instead of shared dict + locks dict
+consider caching dataset names instead of dataset itself
 '''
 
 def worker_function(job_queue, result_queue, worker_stats, stats_lock):
@@ -417,10 +419,6 @@ class ResourceAwareScheduler:
                 logger.error(f"Error stopping scheduler thread: {e}")
                 raise
 
-        # Clear references to managed objects
-        self.shared = None
-        self.locks = None
-
         logger.info("Scheduler shutdown complete")
 
     def __enter__(self):
@@ -657,64 +655,61 @@ def generic_parallel_grid_search(
         cpu_cores_per_job=cpu_cores_per_job,
         gpu_memory_per_job_gb=gpu_memory_per_job_gb,
     )
-    
-    # Create job generator
-    job_generator = GenericJobGenerator(
-        job_factory=job_factory,
-        total_configs=total_configs,
-        samples_per_config=samples_per_config
-    )
-    
-    try:
-        with ResourceAwareScheduler(resource_manager=resource_manager) as scheduler:
-            total_jobs = len(job_generator)
-            logger.info(f"Submitting {total_jobs} jobs to scheduler")
-            
-            for job in job_generator:
-                scheduler.add_job(job)
-            
-            scheduler.start()
-            
-            # Wait for completion
-            start_time = time.time()
-            with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
-                last_count = 0
-                while scheduler.completed_count < total_jobs and scheduler.running:
-                    current_count = scheduler.completed_count
-                    if current_count > last_count:
-                        pbar.update(current_count - last_count)
-                        last_count = current_count
-                    time.sleep(0.5)
-            
-            if scheduler.completed_count == total_jobs:
-                elapsed_time = time.time() - start_time
-                logger.info(f"Grid search completed in {elapsed_time:.1f}s")
-                
-                # Extract results from shared state
-                history = None
-                best_params = None
 
-                shared = job_generator.shared 
-                locks = job_generator.locks
-                with locks.get('history', locks):
-                    history = list(shared.get('history', []))
+    try:
+        with GenericJobGenerator(job_factory=job_factory,
+                                 total_configs=total_configs,
+                                 samples_per_config=samples_per_config,
+        ) as job_generator:
+            with ResourceAwareScheduler(resource_manager=resource_manager) as scheduler:
+                total_jobs = len(job_generator)
+                logger.info(f"Submitting {total_jobs} jobs to scheduler")
                 
-                with locks.get('best_params', locks):
-                    best_params = dict(shared.get('best_params', {}))
+                for job in job_generator:
+                    scheduler.add_job(job)
                 
-                # Process results if callback provided
-                if process_results:
-                    process_results(history, best_params, output_path)
-                else:
-                    # Default: save history as HDF5
-                    if history:
-                        history_df = pd.DataFrame(history)
-                        file_path = output_path / 'log.h5'
-                        history_df.to_hdf(file_path, key='df', mode='w')
-                        logger.info(f"Saved {len(history)} results to {file_path}")
+                scheduler.start()
                 
-                return history, best_params
+                # Wait for completion
+                start_time = time.time()
+                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
+                    last_count = 0
+                    while scheduler.completed_count < total_jobs and scheduler.running:
+                        current_count = scheduler.completed_count
+                        if current_count > last_count:
+                            pbar.update(current_count - last_count)
+                            last_count = current_count
+                        time.sleep(0.5)
                 
+                if scheduler.completed_count == total_jobs:
+                    elapsed_time = time.time() - start_time
+                    logger.info(f"Grid search completed in {elapsed_time:.1f}s")
+                    
+                    # Extract results from shared state
+                    history = None
+                    best_params = None
+
+                    shared = job_generator.shared 
+                    locks = job_generator.locks
+                    with locks.get('history', locks):
+                        history = list(shared.get('history', []))
+                    
+                    with locks.get('best_params', locks):
+                        best_params = dict(shared.get('best_params', {}))
+                    
+                    # Process results if callback provided
+                    if process_results:
+                        process_results(history, best_params, output_path)
+                    else:
+                        # Default: save history as HDF5
+                        if history:
+                            history_df = pd.DataFrame(history)
+                            file_path = output_path / 'log.h5'
+                            history_df.to_hdf(file_path, key='df', mode='w')
+                            logger.info(f"Saved {len(history)} results to {file_path}")
+                    
+                    return history, best_params
+                    
     except KeyboardInterrupt:
         logger.info("Main function received KeyboardInterrupt, ensuring cleanup")
         raise
