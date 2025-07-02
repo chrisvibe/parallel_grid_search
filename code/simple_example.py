@@ -7,12 +7,9 @@ This trains a single linear layer on synthetic data with different hyperparamete
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 from dataclasses import dataclass
-from typing import Dict, Any, Callable
 import time
 import logging
-from pathlib import Path
 import pandas as pd
 from copy import deepcopy
 
@@ -73,6 +70,7 @@ class SyntheticDataset:
 @dataclass
 class SimpleParams:
     """Parameter structure for the simple example"""
+    out_path: str = "out/simple_grid_search_results"
     learning_rate: float = 0.01
     hidden_size: int = 64
     epochs: int = 50
@@ -103,12 +101,13 @@ class SimpleLinearJob(JobInterface):
         start_time = time.time()
         
         # Create dataset
-        dataset = SyntheticDataset(
-            n_samples=self.params.n_samples,
-            n_features=self.params.n_features,
-            noise=self.params.noise,
-            device=device
-        ).to(device)
+        with self.locks['dataset_lock']:
+            dataset = SyntheticDataset(
+                n_samples=self.params.n_samples,
+                n_features=self.params.n_features,
+                noise=self.params.noise,
+                device=device
+            ).to(device)
         
         # Create model
         model = SimpleLinearModel(
@@ -117,7 +116,7 @@ class SimpleLinearJob(JobInterface):
         ).to(device)
         
         # Train model
-        final_loss, final_accuracy = self._train_model(model, dataset, device)
+        final_loss, final_accuracy = self._train_model(model, dataset)
         
         training_time = time.time() - start_time
         
@@ -155,7 +154,7 @@ class SimpleLinearJob(JobInterface):
         
         return {'status': 'success', 'stats': results}
     
-    def _train_model(self, model, dataset, device):
+    def _train_model(self, model, dataset):
         """Train the model and return metrics"""
         optimizer = optim.Adam(model.parameters(), lr=self.params.learning_rate)
         criterion = nn.MSELoss()
@@ -352,7 +351,7 @@ if __name__ == "__main__":
     
     # Run grid search
     history, best_params = simple_parallel_grid_search(
-        output_path="simple_grid_search_results",
+        output_path=SimpleParams.out_path,
         samples_per_config=2,  # Reduced for demo
         gpu_memory_per_job_gb=0.5,
         cpu_memory_per_job_gb=1.0,

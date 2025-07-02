@@ -2,7 +2,6 @@ import time
 import psutil
 import pynvml
 import torch
-from torch.utils.data import Dataset
 from collections import defaultdict, deque
 from os import environ, sched_getaffinity, cpu_count
 import torch.multiprocessing as mp
@@ -53,8 +52,6 @@ class JobInterface(ABC):
         return f"Config: {config_str}, Sample: {sample_str}"
 
 
-
-
 class GenericJobGenerator:
     """Generic job generator that can create any type of job"""
     
@@ -69,15 +66,12 @@ class GenericJobGenerator:
         self.mp_manager = mp.Manager()
         self.shared = {
             'best_params': self.mp_manager.dict({'loss': None, 'params': None}),
-            'dataset_cache': self.mp_manager.dict(),
-            'dataset_scores': self.mp_manager.dict(),
             'history': self.mp_manager.list(),
         }
         self.locks = {
             'best_params': self.mp_manager.Lock(),
-            'dataset_cache': self.mp_manager.Lock(),
-            'dataset_scores': self.mp_manager.Lock(),
             'history': self.mp_manager.Lock(),
+            'dataset_lock': self.mp_manager.Lock(), # in case there is data generation (write not just read)
         }
     
     def __iter__(self):
@@ -106,12 +100,10 @@ class GenericJobGenerator:
         """Clean up multiprocessing resources"""
         try:
             # Clear shared objects - use del or slice assignment for proxies
+            if 'best_params' in self.shared:
+                self.shared['best_params'].clear()  # Clear dict proxy
             if 'history' in self.shared:
                 del self.shared['history'][:]  # Clear list proxy
-            if 'dataset_cache' in self.shared:
-                self.shared['dataset_cache'].clear()  # DictProxy does have clear()
-            if 'dataset_scores' in self.shared:
-                self.shared['dataset_scores'].clear()
             
             # Clear references
             self.shared.clear()

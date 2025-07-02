@@ -23,7 +23,6 @@ not sure dataset_cache memory scheme is optimal
 reduce complexity / redundance + make more modular
 optimizer for scheduler to find settings that maximize throughput: type cpu/gpu, concurrency, number of cores, throughput
 split into cpu and gpu queue since they may require different resources
-use torch.multiprocessing.shared_memory_ instead of shared dict + locks dict
 consider caching dataset names instead of dataset itself
 '''
 
