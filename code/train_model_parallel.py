@@ -18,19 +18,22 @@ logger = logging.getLogger(__name__)
 
 '''
 TODO
-set dataset_cache limit dynamically
-not sure dataset_cache memory scheme is optimal
 reduce complexity / redundance + make more modular
 optimizer for scheduler to find settings that maximize throughput: type cpu/gpu, concurrency, number of cores, throughput
 split into cpu and gpu queue since they may require different resources
-consider caching dataset names instead of dataset itself
 '''
 
-def worker_function(job_queue, result_queue, cores_per_job, worker_stats, stats_lock):
+def worker_function(job_queue, result_queue, cores_per_job, priority, worker_stats, stats_lock):
     """Worker with proper stat tracking"""
     set_num_interop_threads(1)
     set_num_threads(cores_per_job)
     p = psutil.Process()
+    # Set process priority to prevent freezing and prioritized gpu jobs over cpu jobs
+    try:
+        p.nice(priority)
+    except (psutil.AccessDenied, PermissionError):
+        pass
+
     worker_registered = False
     try:
         # Register worker as idle
@@ -62,13 +65,6 @@ def worker_function(job_queue, result_queue, cores_per_job, worker_stats, stats_
                 resources_allocated = resources.get('resources_allocated', False)
                 device = resources['device']
 
-                # Set process priority to prevent freezing and prioritized gpu jobs over cpu jobs
-                is_gpu = device.type == 'cuda'
-                try:
-                    p.nice(5 if is_gpu else 10)
-                except (psutil.AccessDenied, PermissionError):
-                    pass
-                
                 # Run job (this is when we're actually "busy")
                 start_time = time.time()
                 result = job.run(device)
@@ -127,10 +123,11 @@ def worker_function(job_queue, result_queue, cores_per_job, worker_stats, stats_
 class LazyWorkerPool:
     """Simplified worker pool that creates workers on demand"""
 
-    def __init__(self, max_workers: int, cores_per_job: int):
+    def __init__(self, max_workers: int, cores_per_job: int, process_priority=5):
         mp.set_start_method('spawn', force=True)
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
+        self.process_priority = process_priority
         self.worker_job_queue = Queue()
         self.result_queue = Queue()
 
@@ -188,6 +185,7 @@ class LazyWorkerPool:
             return self.scale_up_workers(target_workers - current)
         elif target_workers < current:
             return self.scale_down_workers(current - target_workers)
+        return 0
             
     def scale_up_workers(self, count=1):
         """Add new workers up to max_workers limit"""
@@ -203,7 +201,7 @@ class LazyWorkerPool:
                 # Create new worker with shared state
                 p = Process(
                     target=worker_function,
-                    args=(self.worker_job_queue, self.result_queue, self.cores_per_job, self.worker_stats, self.stats_lock)
+                    args=(self.worker_job_queue, self.result_queue, self.cores_per_job, self.process_priority, self.worker_stats, self.stats_lock)
                 )
                 p.start()
                 self.workers[p.pid] = p
@@ -335,7 +333,9 @@ class ResourceAwareScheduler:
         self.scheduler_loop_delay = scheduler_loop_delay
         
         # Worker pool
-        self.worker_pool = LazyWorkerPool(max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cpu_manager.cores_per_job)
+        self.cpu_worker_pool = LazyWorkerPool(max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cpu_manager.cores_per_job, process_priority=5)
+        self.gpu_worker_pool = LazyWorkerPool(max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cpu_manager.cores_per_job, process_priority=10)
+        self.worker_pools = {'cpu': self.cpu_worker_pool, 'gpu': self.gpu_worker_pool}
         
         # Job tracking
         self.job_queue = Queue()
@@ -347,7 +347,7 @@ class ResourceAwareScheduler:
         # Scaling parameters
         self.last_scaling_time = time.time()
         self.scaling_interval = 30  # seconds
-        self.target_concurrency = max(1, self.resource_manager.cpu_manager.max_jobs // 3)
+        self.target_concurrency = max(1, self.resource_manager.cpu_manager.max_processes // 3)
         self.job_buffer = int(round(self.target_concurrency / 2 + 0.5))
     
     @property
@@ -356,15 +356,19 @@ class ResourceAwareScheduler:
 
     @property
     def jobs_in_flight(self):
-        return self.worker_pool.get_jobs_in_flight
+        return self.cpu_worker_pool.get_jobs_in_flight + self.gpu_worker_pool.get_jobs_in_flight
 
     @property
     def jobs_in_worker_backlog(self):
-        return self.worker_pool.backlog
+        return self.cpu_worker_pool.backlog + self.gpu_worker_pool.backlog
 
     @property
     def completed_count(self):
-        return self.worker_pool.get_jobs_completed
+        return self.cpu_worker_pool.get_jobs_completed + self.gpu_worker_pool.get_jobs_completed
+
+    @property
+    def max_workers(self):
+        return self.cpu_worker_pool.max_workers + self.gpu_worker_pool.max_workers
         
     def start(self):
         """Start scheduler"""
@@ -372,13 +376,20 @@ class ResourceAwareScheduler:
         
         logger.debug(f"Added initial jobs and workers {self.target_concurrency}")
         self._schedule_jobs(n_jobs=self.target_concurrency)
-        self.worker_pool.scale_up_workers(self.target_concurrency)
+        self.scale_up_workers(self.target_concurrency)
         
         self.scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self.scheduler_thread.start()
         
         logger.info("Scheduler started")
         return self.running
+    
+    def scale_up_workers(self, target: int):
+        gpu_added = self.gpu_worker_pool.scale_up_workers(target)
+        cpu_added = 0
+        if gpu_added < target:
+            cpu_added = self.cpu_worker_pool.scale_up_workers(target - gpu_added)
+        return gpu_added + cpu_added
     
     def stop(self):
         """Stop the scheduler and clean up all resources"""
@@ -397,7 +408,8 @@ class ResourceAwareScheduler:
 
         # Delegate worker pool shutdown
         try:
-            self.worker_pool.shutdown()
+            self.cpu_worker_pool.shutdown()
+            self.gpu_worker_pool.shutdown()
         except Exception as e:
             logger.error(f"Error shutting down worker pool: {e}")
         
@@ -497,9 +509,13 @@ class ResourceAwareScheduler:
         device = self.resource_manager.try_allocate_resources()
 
         if device is not None:
+            is_gpu = device.type == 'cuda'
             try:
                 logger.debug(f"Scheduled job on device {device}")
-                self.worker_pool.submit_job(job, device)
+                if is_gpu:
+                    self.gpu_worker_pool.submit_job(job, device)
+                else:
+                    self.cpu_worker_pool.submit_job(job, device)
                 
                 # Thundering herd prevention
                 delay = self._calculate_submission_delay()
@@ -509,7 +525,7 @@ class ResourceAwareScheduler:
             except Exception as e:
                 # Job submission failed - must release resources
                 logger.error(f"Failed to submit job, releasing resources: {e}")
-                if device.type == 'cuda':
+                if is_gpu:
                     self.resource_manager.release_gpu(device.index)
                 self.resource_manager.release_cpu()
                 return False
@@ -537,7 +553,7 @@ class ResourceAwareScheduler:
         elif (jobs_completed_in_interval > 0 and 
             self.jobs_in_flight >= self.target_concurrency * 0.8 and 
             self.resource_manager.cpu_manager.can_allocate_job()):
-            if self.target_concurrency < self.worker_pool.max_workers:
+            if self.target_concurrency < self.max_workers:
                 self.target_concurrency += 1
                 logger.info(f"Increased concurrency to {self.target_concurrency} "
                             f"({jobs_completed_in_interval} jobs completed in last {self.scaling_interval}s)")
@@ -547,12 +563,15 @@ class ResourceAwareScheduler:
             logger.warning(f"No jobs completed in last {self.scaling_interval}s - "
                             f"{self.jobs_in_flight} jobs in flight, concurrency: {self.target_concurrency}")
 
-        # adjust GPU concurrency
+        # adjust GPU target concurrency (might not be possible due to cpu constraints ++)
         if self.resource_manager.gpu_manager:
-            self.resource_manager.gpu_manager.adjust_concurrency()
+            self.resource_manager.gpu_manager.adjust_target_concurrency()
         
-        # propagate changes to workers
-        self.worker_pool.scale_workers_to(self.target_concurrency)
+        # propagate changes to worker pools
+        gpu_workers_target = max(self.resource_manager.get_gpu_capacity(), self.target_concurrency)
+        gpu_workers_added = self.gpu_worker_pool.scale_workers_to(gpu_workers_target)
+        cpu_workers_target = self.target_concurrency - gpu_workers_added
+        self.cpu_worker_pool.scale_workers_to(cpu_workers_target)
         
         if self.resource_manager.gpu_manager:
             logger.info(self.resource_manager.gpu_manager.get_status())
@@ -574,11 +593,12 @@ class ResourceAwareScheduler:
                 if n_jobs > 0 and self.running:
                     self._schedule_jobs(n_jobs=n_jobs)
 
-                while self.running:
-                    result = self.worker_pool.get_result(timeout=0.1)
-                    if result is None or not self.running:
-                        break
-                    self._handle_job_completion(result)
+                for worker_pool in self.worker_pools.values():
+                    while self.running:
+                        result = worker_pool.get_result(timeout=0.1)
+                        if result is None or not self.running:
+                            break
+                        self._handle_job_completion(result)
 
                 # Adjust concurrency based on completion rate
                 current_time = time.time()

@@ -138,7 +138,7 @@ def grouped_bar_graph(values, width=32):
 class CPUJobResourceManager:
     """Simplified CPU resource manager with SLURM support"""
     def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, 
-                 max_memory_usage=0.8, max_cpu_usage=0.8, max_jobs=None):
+                 max_memory_usage=0.8, max_cpu_usage=0.8, max_processes=None):
         self.memory_per_job_gb = memory_per_job_gb
         self.cores_per_job = cores_per_job
         self.max_memory_usage = max_memory_usage
@@ -151,7 +151,8 @@ class CPUJobResourceManager:
         self._detect_constraints()
         
         # Calculate max concurrent jobs
-        self.max_jobs = max_jobs if max_jobs else self._calculate_max_concurrent()
+        concurrency_estimate = self._calculate_max_concurrent_processes()
+        self.max_processes = max_processes if max_processes else concurrency_estimate 
         
         self._log_initialization()
     
@@ -198,7 +199,7 @@ class CPUJobResourceManager:
             # Use system memory
             self.available_memory_gb = psutil.virtual_memory().total / (1024**3)
     
-    def _calculate_max_concurrent(self):
+    def _calculate_max_concurrent_processes(self):
         """Calculate maximum concurrent jobs based on resources"""
         # Memory-based limit
         usable_memory = self.available_memory_gb * self.max_memory_usage
@@ -219,7 +220,7 @@ class CPUJobResourceManager:
         logger.info(f"  Available Memory: {self.available_memory_gb:.1f}GB")
         logger.info(f"  Memory per job: {self.memory_per_job_gb}GB")
         logger.info(f"  CPU cores per job: {self.cores_per_job}")
-        logger.info(f"  Max concurrent jobs: {self.max_jobs}")
+        logger.info(f"  Max concurrent jobs: {self.max_processes}")
     
     def _get_allocated_cpu_cores(self):
         """Get the set of CPU core IDs available to this process"""
@@ -266,7 +267,7 @@ class CPUJobResourceManager:
     def can_allocate_job(self):
         """Check if resources are available for a new job"""
         # First check against max concurrent limit
-        if self.allocated_jobs >= self.max_jobs:
+        if self.allocated_jobs >= self.max_processes:
             return False
         
         # Get current usage
@@ -316,13 +317,13 @@ class CPUJobResourceManager:
     def handle_oom(self):
         """Handle out-of-memory error by adjusting limits"""
         # Reduce max concurrent jobs
-        old_max = self.max_jobs
-        self.max_jobs = max(1, int(self.max_jobs * 0.8))
+        old_max = self.max_processes
+        self.max_processes = max(1, int(self.max_processes * 0.8))
         
         # Increase memory estimate
         self.memory_per_job_gb *= 1.2
         
-        logger.warning(f"OOM detected: reduced max jobs {old_max} -> {self.max_jobs}, "
+        logger.warning(f"OOM detected: reduced max jobs {old_max} -> {self.max_processes}, "
                           f"increased memory estimate to {self.memory_per_job_gb:.1f}GB")
     
     def get_status(self):
@@ -330,7 +331,7 @@ class CPUJobResourceManager:
         usage = self.get_system_usage()
         env_type = "SLURM" if self.is_slurm else "System"
         
-        status = (f"{env_type}: {self.allocated_jobs}/{self.max_jobs} jobs | "
+        status = (f"{env_type}: {self.allocated_jobs}/{self.max_processes} jobs | "
                   f"{usage['memory_available_gb']:.1f}GB free | "
                   f"{usage['memory_percent']:.0f}% mem | "
                   f"{usage['cpu_percent']:.0f}% cpu")
@@ -720,11 +721,11 @@ class GPUJobResourceManager:
         """Check if any GPUs have pending resets"""
         return any(self.gpu_reset_pending[gpu_id] for gpu_id in self.available_gpus)
 
-    def adjust_concurrency(self):
+    def adjust_target_concurrency(self):
         for gpu_id in self.available_gpus:
-            self._adjust_concurrency(gpu_id)
+            self._adjust_target_concurrency(gpu_id)
 
-    def _adjust_concurrency(self, gpu_id):
+    def _adjust_target_concurrency(self, gpu_id):
         """Adjust concurrency based on performance metrics"""
         if gpu_id not in self.gpu_allocated_jobs or self.gpu_allocated_jobs[gpu_id] == 0:
             return False
@@ -824,4 +825,10 @@ class ComputeJobResourceManager:
 
     @property
     def max_concurrent(self):
-        return self.cpu_manager.max_jobs
+        return self.cpu_manager.max_processes
+
+    def get_gpu_capacity(self):
+        if self.use_gpu:
+            return self.gpu_manager.get_total_capacity()
+        else:
+            return 0
