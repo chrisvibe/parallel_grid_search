@@ -8,6 +8,7 @@ from torch import set_num_threads, set_num_interop_threads
 import psutil
 import pandas as pd
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 import threading
 from typing import Tuple, Callable, List, Dict, Any
 from projects.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
@@ -660,14 +661,15 @@ def generic_parallel_grid_search(
                 
                 # Wait for completion
                 start_time = time.time()
-                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
-                    last_count = 0
-                    while scheduler.completed_count < total_jobs and scheduler.running:
-                        current_count = scheduler.completed_count
-                        if current_count > last_count:
-                            pbar.update(current_count - last_count)
-                            last_count = current_count
-                        time.sleep(0.5)
+                with logging_redirect_tqdm():
+                    with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
+                        last_count = 0
+                        while scheduler.completed_count < total_jobs and scheduler.running:
+                            current_count = scheduler.completed_count
+                            if current_count > last_count:
+                                pbar.update(current_count - last_count)
+                                last_count = current_count
+                            time.sleep(0.5)
                 
                 if scheduler.completed_count == total_jobs:
                     elapsed_time = time.time() - start_time
