@@ -144,14 +144,13 @@ class CPUJobResourceManager:
         self.max_memory_usage = max_memory_usage
         self.max_cpu_usage = max_cpu_usage
         
-        # Simple state
-        self.allocated_jobs = 0
-        
         # Detect environment constraints
         self._detect_constraints()
         
-        # Calculate max concurrent jobs
+        # State
+        self.allocated_jobs = 0
         concurrency_estimate = self._calculate_max_concurrent_processes()
+        self.target_concurrency = max(1, concurrency_estimate // 2)
         self.max_processes = max_processes if max_processes else concurrency_estimate 
         
         self._log_initialization()
@@ -262,7 +261,6 @@ class CPUJobResourceManager:
             'cpu_per_core': cpu_per_core,
             'swap_percent': psutil.swap_memory().percent,
         }
-    
    
     def can_allocate_job(self):
         """Check if resources are available for a new job"""
@@ -274,7 +272,7 @@ class CPUJobResourceManager:
         usage = self.get_system_usage()
         
         # Check memory availability
-        if usage['memory_available_gb'] < self.memory_per_job_gb * 1.1:  # 10% buffer
+        if usage['memory_available_gb'] < self.memory_per_job_gb * 1.1:
             logger.debug(f"Insufficient memory: {usage['memory_available_gb']:.1f}GB available")
             return False
         
@@ -341,11 +339,24 @@ class CPUJobResourceManager:
             status += f" | cores: {grouped_bar_graph(usage['cpu_per_core'])}"
         
         return status
-        
+    
     def total_cpu_cores(self):
         """Get total available CPU cores"""
-        return self.available_cpus  # Fixed: Return just the count, not tuple
+        return self.available_cpus
+
+    def adjust_target_concurrency(self):
+        if self.should_decrease_concurrency():
+            self.target_concurrency -= 1
+        elif self.should_increase_concurrency():
+            self.target_concurrency += 1
+        return self.target_concurrency
     
+    def should_decrease_concurrency(self):
+        return (self.target_concurrency > self.allocated_jobs) and (self.target_concurrency > 1) and (not self.can_allocate_job())
+
+    def should_increase_concurrency(self):
+        return (self.allocated_jobs >= self.target_concurrency) and (self.target_concurrency < self.max_processes) and self.can_allocate_job()
+
 
 class GPUJobResourceManager:
     def __init__(self, memory_per_job_gb=2.0, buffer_mb=100, memory_reset_threshold=0.9, initial_concurrency=2):
@@ -633,7 +644,6 @@ class GPUJobResourceManager:
 
         return None
 
-
     def release(self, gpu_id):
         """Release GPU and perform reset if needed"""
         if gpu_id in self.gpu_allocated_jobs:
@@ -724,6 +734,7 @@ class GPUJobResourceManager:
     def adjust_target_concurrency(self):
         for gpu_id in self.available_gpus:
             self._adjust_target_concurrency(gpu_id)
+        return self.gpu_max_concurrent
 
     def _adjust_target_concurrency(self, gpu_id):
         """Adjust concurrency based on performance metrics"""
@@ -776,6 +787,8 @@ class ComputeJobResourceManager:
         self.gpu_manager = None
         if self.use_gpu:
             self.gpu_manager = GPUJobResourceManager(memory_per_job_gb=gpu_memory_per_job_gb)
+
+        self.target_concurrency_split_by_resource = {'cpu': self.cpu_target_concurrency, 'gpu': self.gpu_target_concurrency}
         logger.info(f"Mode: {'GPU+CPU' if self.use_gpu else 'CPU only'}")
 
     def try_allocate_resources(self):
@@ -827,8 +840,21 @@ class ComputeJobResourceManager:
     def max_concurrent(self):
         return self.cpu_manager.max_processes
 
-    def get_gpu_capacity(self):
+    @property
+    def gpu_target_concurrency(self):
         if self.use_gpu:
             return self.gpu_manager.get_total_capacity()
         else:
             return 0
+    
+    @property
+    def cpu_target_concurrency(self):
+        return self.cpu_manager.target_concurrency
+    
+    def adjust_target_concurrency(self):
+        target_concurrency_cpu_and_gpu = self.cpu_manager.adjust_target_concurrency()
+        if self.use_gpu:
+            target_concurrency_per_gpu = self.gpu_manager.adjust_target_concurrency()
+            self.target_concurrency_split_by_resource['gpu'] = min(sum(target_concurrency_per_gpu.values()), target_concurrency_cpu_and_gpu)
+        self.target_concurrency_split_by_resource['cpu'] = target_concurrency_cpu_and_gpu - self.target_concurrency_split_by_resource['gpu'] 
+        return self.target_concurrency_split_by_resource
