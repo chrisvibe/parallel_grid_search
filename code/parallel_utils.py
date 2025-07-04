@@ -138,7 +138,7 @@ def grouped_bar_graph(values, width=32):
 class CPUJobResourceManager:
     """Simplified CPU resource manager with SLURM support"""
     def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, 
-                 max_memory_usage=0.8, max_cpu_usage=1.0, max_processes=None):
+                 max_memory_usage=0.8, max_cpu_usage=1.0, max_jobs=None):
         self.memory_per_job_gb = memory_per_job_gb
         self.cores_per_job = cores_per_job
         self.max_memory_usage = max_memory_usage
@@ -151,7 +151,7 @@ class CPUJobResourceManager:
         self.allocated_jobs = 0
         concurrency_estimate = self._calculate_max_concurrent_processes()
         self.target_concurrency = max(1, concurrency_estimate // 2)
-        self.max_processes = max_processes if max_processes else concurrency_estimate 
+        self.max_jobs = max_jobs if max_jobs else max(1, self.available_cpus // cores_per_job)
         
         self._log_initialization()
     
@@ -219,7 +219,7 @@ class CPUJobResourceManager:
         logger.info(f"  Available Memory: {self.available_memory_gb:.1f}GB")
         logger.info(f"  Memory per job: {self.memory_per_job_gb}GB")
         logger.info(f"  CPU cores per job: {self.cores_per_job}")
-        logger.info(f"  Max concurrent jobs: {self.max_processes}")
+        logger.info(f"  Max concurrent jobs: {self.max_jobs}")
     
     def _get_allocated_cpu_cores(self):
         """Get the set of CPU core IDs available to this process"""
@@ -265,7 +265,8 @@ class CPUJobResourceManager:
     def can_allocate_job(self):
         """Check if resources are available for a new job"""
         # First check against max concurrent limit
-        if self.allocated_jobs >= self.max_processes:
+        if self.allocated_jobs >= self.max_jobs:
+            logger.debug(f"Too many jobs: {self.allocated_jobs}/{self.max_jobs}")
             return False
         
         # Get current usage
@@ -278,7 +279,7 @@ class CPUJobResourceManager:
         
         # Check if we have per-core CPU data
         cpu_per_core = usage.get('cpu_per_core')
-        if cpu_per_core and self.available_cpus > 0:  # Fixed: Check for empty list
+        if cpu_per_core and self.available_cpus > 0:
             # Check if at least cores_per_job of our allocated cores are idle
             idle_cores = sum(core < 10.0 for core in cpu_per_core)  # < 10% usage = idle
             idle_ratio = idle_cores / self.available_cpus 
@@ -305,23 +306,25 @@ class CPUJobResourceManager:
         """Try to allocate resources for a job"""
         if self.can_allocate_job():
             self.allocated_jobs += 1
+            # logger.debug(f'Incremented job count {self.allocated_jobs}/{self.max_jobs}')
             return True
         return False
     
     def release(self):
         """Release resources from a completed job"""
         self.allocated_jobs -= 1
+        # logger.debug(f'Decremented job count {self.allocated_jobs}/{self.max_jobs}')
     
     def handle_oom(self):
         """Handle out-of-memory error by adjusting limits"""
         # Reduce max concurrent jobs
-        old_max = self.max_processes
-        self.max_processes = max(1, int(self.max_processes * 0.8))
+        old_max = self.max_jobs
+        self.max_jobs = max(1, int(self.max_jobs * 0.8))
         
         # Increase memory estimate
         self.memory_per_job_gb *= 1.2
         
-        logger.warning(f"OOM detected: reduced max jobs {old_max} -> {self.max_processes}, "
+        logger.warning(f"OOM detected: reduced max jobs {old_max} -> {self.max_jobs}, "
                           f"increased memory estimate to {self.memory_per_job_gb:.1f}GB")
     
     def get_status(self):
@@ -329,7 +332,7 @@ class CPUJobResourceManager:
         usage = self.get_system_usage()
         env_type = "SLURM" if self.is_slurm else "System"
         
-        status = (f"{env_type}: {self.allocated_jobs}/{self.max_processes} jobs | "
+        status = (f"{env_type}: {self.allocated_jobs}/{self.max_jobs} jobs | "
                   f"{usage['memory_available_gb']:.1f}GB free | "
                   f"{usage['memory_percent']:.0f}% mem | "
                   f"{usage['cpu_percent']:.0f}% cpu")
@@ -352,10 +355,12 @@ class CPUJobResourceManager:
         return self.target_concurrency
     
     def should_decrease_concurrency(self):
-        return (self.target_concurrency > self.allocated_jobs) and (self.target_concurrency > 1) and (not self.can_allocate_job())
+        if self.target_concurrency > 1 and (self.target_concurrency > self.max_jobs) and not self.should_increase_concurrency():
+            return True
+        return False
 
     def should_increase_concurrency(self):
-        return (self.allocated_jobs >= self.target_concurrency) and (self.target_concurrency < self.max_processes) and self.can_allocate_job()
+        return self.can_allocate_job()
 
 
 class GPUJobResourceManager:
@@ -579,7 +584,7 @@ class GPUJobResourceManager:
         _, avg_compute_util = self._get_gpu_compute_utilization(gpu_id)
         
         # Only increase if compute utilization is moderate (not too low, not too high)
-        return 0.2 < avg_compute_util <= 0.85
+        return 0.1 < avg_compute_util <= 0.9
 
     def should_decrease_concurrency(self, gpu_id):
         """Check if we should decrease concurrency on this GPU"""
@@ -676,11 +681,12 @@ class GPUJobResourceManager:
             logger.info(f"GPU {gpu_id} reset complete")
             
         except Exception as e:
-            logger.error(f"Error resetting GPU {gpu_id}: {e}")
+            logger.error(f"Resetting GPU {gpu_id}: {e}")
             self.gpu_reset_pending[gpu_id] = False
 
     def handle_oom(self, gpu_id):
         """Handle out-of-memory error"""
+        logger.warning(f"OOM on GPU {gpu_id}")
         if gpu_id in self.gpu_allocated_jobs:
             # Trigger reset
             self._mark_for_reset(gpu_id, 1.0)
@@ -788,43 +794,40 @@ class ComputeJobResourceManager:
         if self.use_gpu:
             self.gpu_manager = GPUJobResourceManager(memory_per_job_gb=gpu_memory_per_job_gb)
 
-        self.target_concurrency_split_by_resource = {'cpu': self.cpu_target_concurrency, 'gpu': self.gpu_target_concurrency}
         logger.info(f"Mode: {'GPU+CPU' if self.use_gpu else 'CPU only'}")
 
     def try_allocate_resources(self):
         """Try to allocate resources for a job - atomic operation"""
-        gpu_id = None
-        cpu_allocated = False
+        allocated_device = None
         
         try:
             # Always try to allocate CPU first
             cpu_allocated = self.cpu_manager.try_allocate_cpu()
             if not cpu_allocated:
                 return None
+            
+            # At this point, CPU is allocated
+            allocated_device = torch.device('cpu')
                 
             # Try GPU if available
             if self.use_gpu:
                 gpu_id = self.gpu_manager.try_allocate_gpu()
                 if gpu_id is not None:
-                    return torch.device(f'cuda:{gpu_id}')
+                    allocated_device = torch.device(f'cuda:{gpu_id}')
             
-            # CPU only mode or GPU allocation failed
-            return torch.device('cpu')
+            return allocated_device
             
-        except Exception:
-            # Clean up on any error
-            if cpu_allocated:
-                self.cpu_manager.release()
-            if gpu_id is not None:
-                self.gpu_manager.release(gpu_id)
+        except Exception as e:
+            # Clean up using the same release method
+            if allocated_device is not None:
+                self.release_resources(allocated_device)
             return None
 
-    def release_gpu(self, gpu_id):
-        if gpu_id is not None:
-            return self.gpu_manager.release(gpu_id)
-    
-    def release_cpu(self):
-        return self.cpu_manager.release()
+    def release_resources(self, device):
+        """Release resources based on device - single entry point"""
+        if device.type == 'cuda':
+            self.gpu_manager.release(device.index)
+        self.cpu_manager.release()
 
     def handle_oom(self, device):
         if device.type == 'cuda':
@@ -838,7 +841,11 @@ class ComputeJobResourceManager:
 
     @property
     def max_concurrent(self):
-        return self.cpu_manager.max_processes
+        return self.cpu_manager.max_jobs
+
+    @property
+    def target_concurrency_split_by_resource(self):
+        return {'cpu': self.cpu_manager.target_concurrency, 'gpu': self.gpu_target_concurrency}
 
     @property
     def gpu_target_concurrency(self):
@@ -848,8 +855,8 @@ class ComputeJobResourceManager:
             return 0
     
     @property
-    def cpu_target_concurrency(self):
-        return self.cpu_manager.target_concurrency
+    def cores_per_job(self):
+        return self.cpu_manager.cores_per_job
     
     def adjust_target_concurrency(self):
         target_concurrency_cpu_and_gpu = self.cpu_manager.adjust_target_concurrency()
