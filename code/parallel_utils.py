@@ -138,7 +138,7 @@ def grouped_bar_graph(values, width=32):
 class CPUJobResourceManager:
     """Simplified CPU resource manager with SLURM support"""
     def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, 
-                 max_memory_usage=0.8, max_cpu_usage=0.8, max_processes=None):
+                 max_memory_usage=0.8, max_cpu_usage=1.0, max_processes=None):
         self.memory_per_job_gb = memory_per_job_gb
         self.cores_per_job = cores_per_job
         self.max_memory_usage = max_memory_usage
@@ -205,7 +205,7 @@ class CPUJobResourceManager:
         memory_limited_jobs = int(usable_memory / self.memory_per_job_gb)
         
         # CPU-based limit
-        usable_cpus = self.available_cpus * self.max_cpu_usage
+        usable_cpus = (self.available_cpus - 1) * self.max_cpu_usage # always leave at least one
         cpu_limited_jobs = int(usable_cpus / self.cores_per_job)
         
         # Take the minimum and ensure at least 1

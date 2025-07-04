@@ -314,7 +314,7 @@ class LazyWorkerPool:
 
         logger.debug(f"{self.name}: Worker job queue size after: {self.worker_job_queue.qsize()}")
         logger.debug(f"{self.name}: Result queue size after: {self.result_queue.qsize()}")
-        logger.info("{self.name}: shutdown complete")
+        logger.info(f"{self.name}: shutdown complete")
     
 
 class ResourceAwareScheduler:
@@ -334,7 +334,7 @@ class ResourceAwareScheduler:
         
         # Job tracking
         self.job_queue = Queue()
-        self.job_completion_times = [30]  # Circular buffer for completion times (init with 30s default)
+        self.job_completion_times = []  # Circular buffer for completion times
         self.max_completion_history = 20
         self.total_queued_jobs = 0
         self.last_completed_count = self.completed_count
@@ -342,11 +342,15 @@ class ResourceAwareScheduler:
         # Scaling parameters
         self.last_scaling_time = time.time()
         self.scaling_interval = 30  # seconds
-        self.job_buffer = int(round(self.target_concurrency_split_by_resource['cpu'] / 2 + 0.5))
+        self.job_buffer = int(round(self.target_concurrency_split_by_resource['cpu'] * 1/2 + 0.5))
 
     @property
     def target_concurrency_split_by_resource(self):
         return self.resource_manager.target_concurrency_split_by_resource 
+
+    @property
+    def target_concurrency(self):
+        return sum(self.target_concurrency_split_by_resource.values()) 
     
     @property
     def jobs_in_queue(self):
@@ -367,14 +371,17 @@ class ResourceAwareScheduler:
     @property
     def max_workers(self):
         return self.cpu_worker_pool.max_workers + self.gpu_worker_pool.max_workers
+
+    @property
+    def average_completion_time(self):
+        return sum(self.job_completion_times) / len(self.job_completion_times) if self.job_completion_times else self.scheduler_loop_delay
         
     def start(self):
         """Start scheduler"""
         self.running = True
         
-        logger.debug(f"Added initial jobs and workers {self.target_concurrency_split_by_resource}")
-        n_jobs = sum(self.target_concurrency_split_by_resource.values())
-        self._schedule_jobs(n_jobs=n_jobs)
+        logger.debug(f"Added initial jobs and workers {self.target_concurrency_split_by_resource}, total: {self.target_concurrency}")
+        self._schedule_jobs(n_jobs=self.target_concurrency)
         self.scale_workers(self.target_concurrency_split_by_resource)
         
         self.scheduler_thread = threading.Thread(target=self._scheduler_loop)
@@ -438,20 +445,23 @@ class ResourceAwareScheduler:
         self.total_queued_jobs += 1
 
     def _calculate_submission_delay(self):
-        """Calculate delay to prevent thundering herd effect"""
-        base_delay = 0.5
+        """Calculate delay using exponential backoff with full jitter"""
+        # Base delay = average job duration / number of workers
+        target_concurrency = self.target_concurrency
+        base_delay = self.average_completion_time / max(1, target_concurrency)
         
-        if len(self.job_completion_times) > 5:
-            avg_completion_time = sum(self.job_completion_times) / len(self.job_completion_times)
-            scale_factor = min(avg_completion_time / 60.0, 3.0)
+        # Simple congestion detection
+        congestion_level = self.jobs_in_flight / max(1, target_concurrency)
+        
+        if congestion_level > 0.8:
+            # Exponential backoff when congested
+            delay = base_delay * (2 ** min(congestion_level * 2, 5))
         else:
-            scale_factor = 1.0
+            # Half speed when not congested
+            delay = base_delay * 0.5
         
-        scaled_delay = base_delay * scale_factor
-        jitter = random.uniform(-0.3, 0.3) * scaled_delay
-        final_delay = max(0.1, scaled_delay + jitter)
-        
-        return final_delay
+        # Full jitter (prevents thundering herd)
+        return random.uniform(0, delay)
 
     def _handle_job_completion(self, result):
         """Handle job completion - only release if resources were actually allocated"""
@@ -534,6 +544,7 @@ class ResourceAwareScheduler:
         """Adjust concurrency based on completion rate and system resources"""
         completed_count = self.completed_count
         jobs_completed_in_interval = completed_count - self.last_completed_count
+        target_concurrency_split_by_resource = self.target_concurrency_split_by_resource
 
         if completed_count % 10 == 0 and completed_count > 0:
             logger.info(f"Progress: {completed_count}/{self.total_queued_jobs} jobs completed")
@@ -541,18 +552,18 @@ class ResourceAwareScheduler:
         if jobs_completed_in_interval > 0:
             # adjust target concurrency
             self.resource_manager.adjust_target_concurrency()
-            self.job_buffer = int(round(self.target_concurrency_split_by_resource['cpu'] / 2 + 0.5)) + 1
+            self.job_buffer = int(round(target_concurrency_split_by_resource['cpu'] + 0.5)) + 1
             # propagate changes to worker pools
-            self.scale_workers(self.target_concurrency_split_by_resource)
+            self.scale_workers(target_concurrency_split_by_resource)
         # Log warning if no progress
         elif jobs_completed_in_interval == 0:
             logger.warning(f"No jobs completed in last {self.scaling_interval}s - "
-                            f"{self.jobs_in_flight} jobs in flight, concurrency: {self.target_concurrency_split_by_resource}")
+                            f"{self.jobs_in_flight} jobs in flight, concurrency: {target_concurrency_split_by_resource}")
         
         if self.resource_manager.gpu_manager:
             logger.info(self.resource_manager.gpu_manager.get_status())
         logger.info(self.resource_manager.cpu_manager.get_status())
-        return completed_count
+        self.last_completed_count = completed_count
 
     def _scheduler_loop(self):
         """Main scheduler loop"""
@@ -563,9 +574,9 @@ class ResourceAwareScheduler:
         try:
             while self.running:
                 # Schedule new jobs
-                in_flight, backlog, target_concurrency_split_by_resource, job_buffer = self.jobs_in_flight, self.backlog, self.target_concurrency_split_by_resource, self.job_buffer
-                n_jobs = sum(target_concurrency_split_by_resource.values()) + job_buffer - backlog - in_flight
-                logger.debug(f'Schedule more? target: {target_concurrency_split_by_resource}, buffer: {job_buffer}, jobs-in-worker-backlog: {backlog}, in-flight: {in_flight}' + (f'-> adding {n_jobs}' if n_jobs > 0 else f'-> no action {n_jobs}'))
+                in_flight, backlog, job_buffer = self.jobs_in_flight, self.backlog, self.job_buffer
+                n_jobs = self.target_concurrency + job_buffer - backlog - in_flight
+                logger.debug(f'Schedule more? target: {self.target_concurrency_split_by_resource}, buffer: {job_buffer}, jobs-in-worker-backlog: {backlog}, in-flight: {in_flight}' + (f'-> adding {n_jobs}' if n_jobs > 0 else f'-> no action {n_jobs}'))
                 if n_jobs > 0 and self.running:
                     self._schedule_jobs(n_jobs=n_jobs)
 
@@ -579,10 +590,9 @@ class ResourceAwareScheduler:
                 # Adjust concurrency based on completion rate
                 current_time = time.time()
                 if (current_time - last_concurrency_check >= self.scaling_interval) and self.running:
-                    self.last_completed_count = self._adjust_concurrency()
+                    self._adjust_concurrency()
                     last_concurrency_check = current_time
-                    avg_completion_time = round(sum(self.job_completion_times) / len(self.job_completion_times))
-                    self.scaling_interval = min(max(1, avg_completion_time), 180)
+                    self.scaling_interval = min(self.average_completion_time * self.target_concurrency, 300)
 
                 if (self.jobs_in_queue == 0) and (self.jobs_in_flight == 0):
                     self.running = False
