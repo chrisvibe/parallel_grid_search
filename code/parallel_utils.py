@@ -355,12 +355,12 @@ class CPUJobResourceManager:
         return self.target_concurrency
     
     def should_decrease_concurrency(self):
-        if self.target_concurrency > 1 and (self.target_concurrency > self.max_jobs) and not self.should_increase_concurrency():
+        if self.target_concurrency > 1 and not self.should_increase_concurrency():
             return True
         return False
 
     def should_increase_concurrency(self):
-        return self.can_allocate_job()
+        return self.can_allocate_job() and (self.target_concurrency < self.max_jobs)
 
 
 class GPUJobResourceManager:
