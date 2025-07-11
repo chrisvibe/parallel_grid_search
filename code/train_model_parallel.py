@@ -1,6 +1,5 @@
-import random
 from pathlib import Path
-import time
+from time import sleep, time
 import queue
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process, Queue
@@ -45,10 +44,10 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
             # Worker is IDLE while waiting for jobs
             job_data = None
             try:
-                job_data = job_queue.get(timeout=1)
+                job_data = job_queue.get(timeout=10)
             except queue.Empty:
-                continue  # Still idle, waiting for jobs
-                
+                break
+                    
             if job_data is None:  # Shutdown signal
                 break
                 
@@ -64,7 +63,7 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 device = resources['device']
 
                 # Run job (this is when we're actually "busy")
-                start_time = time.time()
+                start_time = time()
                 result = job.run(device)
                 
                 # Add metadata
@@ -74,7 +73,7 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                     'device': device,
                     'worker_pid': p.pid,
                     'start_time': start_time,
-                    'stop_time': time.time(),
+                    'stop_time': time(),
                 })
                 
                 job_completed_successfully = True
@@ -119,13 +118,14 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
 class LazyWorkerPool:
     """Simplified worker pool that creates workers on demand"""
 
-    def __init__(self, max_workers: int, cores_per_job: int, process_priority=5, name=None):
+    def __init__(self, max_workers: int, cores_per_job: int, process_priority=5, name=None, spawn_rate=1):
         mp.set_start_method('spawn', force=True)
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
         self.process_priority = process_priority
         self.worker_job_queue = Queue()
         self.result_queue = Queue()
+        self.spawn_delay = spawn_rate 
 
         self.mp_manager = mp.Manager()
         self.worker_stats = self.mp_manager.dict({
@@ -203,6 +203,7 @@ class LazyWorkerPool:
                 logger.info(f"{self.name}: Scaled up {added} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
             else:
                 logger.info(f"{self.name}: Avoided scale up due to idle workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
+            sleep(self.spawn_delay)
         return added
 
     def scale_down_workers(self, count=1):
@@ -213,7 +214,7 @@ class LazyWorkerPool:
             removed += 1
         logger.info(f"{self.name}: Scaled down {removed} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
         return -removed
-
+    
     def submit_job(self, job, device):
         """Submit a job with pre-allocated device"""
         job_data = {
@@ -245,8 +246,8 @@ class LazyWorkerPool:
         logger.debug(f"{self.name}: Result queue size before: {self.result_queue.qsize()}")
         logger.debug(f"{self.name}: Stats before: {self.worker_stats}")
 
-        start_time = time.time()
-        while self.total_workers > 0 and (time.time() - start_time) < timeout:
+        start_time = time()
+        while self.total_workers > 0 and (time() - start_time) < timeout:
             # Send shutdown signals to all workers first
             for _ in range(self.total_workers):
                 try:
@@ -262,7 +263,7 @@ class LazyWorkerPool:
                     process.join(timeout=0.1)
                 else:
                     del self.workers[pid]
-            time.sleep(0.1)
+            sleep(0.1)
         
         items = []
         while not self.worker_job_queue.empty():
@@ -389,6 +390,9 @@ class ResourceAwareScheduler:
         target_concurrency = self.target_concurrency_split_by_resource
         target_gpu = target_concurrency['gpu']
         target_cpu = target_concurrency['cpu']
+        delay = self._calculate_spawn_delay() # Thundering herd prevention
+        self.gpu_worker_pool.spawn_delay = delay
+        self.cpu_worker_pool.spawn_delay = delay
         gpu_delta = self.gpu_worker_pool.scale_workers_to(target_gpu)
         cpu_delta = self.cpu_worker_pool.scale_workers_to(target_cpu)
         return gpu_delta + cpu_delta, target_gpu + target_cpu 
@@ -440,7 +444,7 @@ class ResourceAwareScheduler:
         self.job_queue.put(job)
         self.total_queued_jobs += 1
 
-    def _calculate_submission_delay(self):
+    def _calculate_spawn_delay(self):
         # Fast submission when under capacity
         utilization = self.jobs_in_flight / max(1, self.target_concurrency)
         
@@ -507,9 +511,6 @@ class ResourceAwareScheduler:
                 else:
                     self.cpu_worker_pool.submit_job(job, device)
                 
-                # Thundering herd prevention
-                delay = self._calculate_submission_delay()
-                time.sleep(delay)
                 return True
                 
             except Exception as e:
