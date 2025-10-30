@@ -12,6 +12,8 @@ import threading
 from typing import Tuple, Callable, List, Dict, Any
 from projects.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
 import sys
+import errno
+from os import waitpid, WNOHANG
 
 import logging
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 # Run job (this is when we're actually "busy")
                 start_time = time()
                 result = job.run(device)
+                zombie_reaping() # i.ex dataloader may spawn many threads
                 
                 # Add metadata
                 result.update({
@@ -114,6 +117,15 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 worker_stats['idle'] -= 1  # Worker was idle when it shut down
         logger.info("Worker shut down")
 
+def zombie_reaping():
+    while True:
+        try:
+            pid, _ = waitpid(-1, WNOHANG)
+            if pid == 0:
+                break
+        except OSError as e:
+            if e.errno == errno.ECHILD:
+                break
 
 class LazyWorkerPool:
     """Simplified worker pool that creates workers on demand"""
@@ -404,6 +416,7 @@ class ResourceAwareScheduler:
             
         logger.info("Initiating scheduler shutdown")
         self.running = False
+        zombie_reaping() # i.ex dataloader may spawn many threads
 
         # Close job queue first to prevent new jobs
         try:
@@ -549,6 +562,7 @@ class ResourceAwareScheduler:
         try:
             while self.running:
                 # Schedule new jobs
+                zombie_reaping() # i.ex dataloader may spawn many threads
                 in_flight, backlog, job_buffer = self.jobs_in_flight, self.backlog, self.job_buffer
                 n_jobs = self.target_concurrency + job_buffer - backlog - in_flight
                 logger.debug(f'Schedule more? target: {self.target_concurrency_split_by_resource}, buffer: {job_buffer}, jobs-in-worker-backlog: {backlog}, in-flight: {in_flight} -> ' + (f'adding {n_jobs}' if n_jobs > 0 else f'no action {n_jobs}'))
@@ -569,7 +583,7 @@ class ResourceAwareScheduler:
                 if (self.jobs_in_queue == 0) and (self.jobs_in_flight == 0):
                     self.running = False
                 else:
-                    time.sleep(self.scheduler_loop_delay)
+                    sleep(self.scheduler_loop_delay)
 
         except Exception as e:
             logger.exception(f"Scheduler loop error: {e}")
@@ -642,7 +656,7 @@ def generic_parallel_grid_search(
                 scheduler.start()
                 
                 # Wait for completion
-                start_time = time.time()
+                start_time = time()
                 with logging_redirect_tqdm():
                     with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
                         last_count = 0
@@ -651,10 +665,10 @@ def generic_parallel_grid_search(
                             if current_count > last_count:
                                 pbar.update(current_count - last_count)
                                 last_count = current_count
-                            time.sleep(0.5)
+                            sleep(0.5)
                 
                 if scheduler.completed_count == total_jobs:
-                    elapsed_time = time.time() - start_time
+                    elapsed_time = time() - start_time
                     logger.info(f"Grid search completed in {elapsed_time:.1f}s")
                     
                     # Extract results from shared state
@@ -673,7 +687,7 @@ def generic_parallel_grid_search(
                     if process_results:
                         process_results(history, best_params, output_path)
                     else:
-                        # Default: save history as HDF5
+                        # Default: save history as HDF5 # TODO bad default better to save atomic units over complex classes for compatibility?
                         if history:
                             history_df = pd.DataFrame(history)
                             file_path = output_path / 'log.h5'
