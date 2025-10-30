@@ -598,16 +598,15 @@ def generic_parallel_grid_search(
     total_configs: int,
     samples_per_config: int,
     output_path: Path,
-    
+    save_config: Callable[[Path], None],
+    process_results: Callable[[List[Dict], Dict, Path], Any],
     # Resource parameters
     gpu_memory_per_job_gb: float = None,
     cpu_memory_per_job_gb: float = None,
     cpu_cores_per_job: int = 1,
-    
-    # Optional callbacks
-    save_config: Callable[[Path], None] = None,
-    process_results: Callable[[List[Dict], Dict, Path], Any] = None,
     ) -> Tuple[List[Dict], Dict]:
+    
+    
     """
     Generic parallel grid search that works with any job type.
     
@@ -616,11 +615,11 @@ def generic_parallel_grid_search(
         total_configs: Number of configurations to test
         samples_per_config: Number of samples per configuration
         output_path: Path to save results
+        save_config: Callback to save configuration
+        process_results: Callback to process results
         gpu_memory_per_job_gb: GPU memory per job
         cpu_memory_per_job_gb: CPU memory per job
         cpu_cores_per_job: CPU cores per job
-        save_config: Optional callback to save configuration
-        process_results: Optional callback to process results
         
     Returns:
         Tuple of (history, best_params)
@@ -630,9 +629,8 @@ def generic_parallel_grid_search(
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=False)
     
-    # Save configuration if callback provided
-    if save_config:
-        save_config(output_path)
+    # Save configuration
+    save_config(output_path)
     
     # Initialize scheduler
     resource_manager = ComputeJobResourceManager(
@@ -671,30 +669,20 @@ def generic_parallel_grid_search(
                     elapsed_time = time() - start_time
                     logger.info(f"Grid search completed in {elapsed_time:.1f}s")
                     
-                    # Extract results from shared state
-                    history = None
-                    best_params = None
+            # Extract results from shared state
+            history = None
+            best_params = None
 
-                    shared = job_generator.shared 
-                    locks = job_generator.locks
-                    with locks.get('history', locks):
-                        history = list(shared.get('history', []))
-                    
-                    with locks.get('best_params', locks):
-                        best_params = dict(shared.get('best_params', {}))
-                    
-                    # Process results if callback provided
-                    if process_results:
-                        process_results(history, best_params, output_path)
-                    else:
-                        # Default: save history as HDF5 # TODO bad default better to save atomic units over complex classes for compatibility?
-                        if history:
-                            history_df = pd.DataFrame(history)
-                            file_path = output_path / 'log.h5'
-                            history_df.to_hdf(file_path, key='df', mode='w')
-                            logger.info(f"Saved {len(history)} results to {file_path}")
-                    
-                    return history, best_params
+            shared = job_generator.shared 
+            locks = job_generator.locks
+            with locks.get('history', locks):
+                history = list(shared.get('history', []))
+            
+            # Process results with provided callback
+            process_results(history, best_params, output_path)
+            logger.info(f"Saved {len(history)} results to {output_path}")
+            
+            return history, best_params
                     
     except KeyboardInterrupt:
         logger.info("Main function received KeyboardInterrupt, ensuring cleanup")
