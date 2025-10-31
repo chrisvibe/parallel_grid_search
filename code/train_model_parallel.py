@@ -11,7 +11,6 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 import threading
 from typing import Tuple, Callable, List, Dict, Any
 from projects.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
-import sys
 import errno
 from os import waitpid, WNOHANG
 
@@ -131,14 +130,17 @@ class LazyWorkerPool:
     """Simplified worker pool that creates workers on demand"""
 
     def __init__(self, max_workers: int, cores_per_job: int, process_priority=5, name=None, spawn_rate=1):
-        mp.set_start_method('spawn', force=True)
+        # Don't force set_start_method here - it should be set once globally
+        # mp.set_start_method('spawn', force=True)  # REMOVE THIS
+        
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
         self.process_priority = process_priority
         self.worker_job_queue = Queue()
         self.result_queue = Queue()
         self.spawn_delay = spawn_rate 
-
+        
+        # Each pool gets its OWN manager
         self.mp_manager = mp.Manager()
         self.worker_stats = self.mp_manager.dict({
             'idle': 0,
@@ -147,7 +149,7 @@ class LazyWorkerPool:
             'jobs_failed': 0,
         })
         self.stats_lock = self.mp_manager.Lock()
-        self.workers = dict() # pid -> process
+        self.workers = dict()
         
         self.name = self.__class__.__name__ if name is None else name
         logger.info(f"{self.name} initialized with max_workers={max_workers}")
@@ -250,81 +252,132 @@ class LazyWorkerPool:
             else:
                 logger.debug(f"{self.name}: Result queue Value Error")
             return None
-    
+
     def shutdown(self, timeout=30):
         """Shutdown all workers and clean up resources"""
         logger.info(f"{self.name}: Initiating LazyWorkerPool shutdown")
-        logger.debug(f"{self.name}: Worker Job queue size before: {self.worker_job_queue.qsize()}")
-        logger.debug(f"{self.name}: Result queue size before: {self.result_queue.qsize()}")
-        logger.debug(f"{self.name}: Stats before: {self.worker_stats}")
-
-        start_time = time()
-        while self.total_workers > 0 and (time() - start_time) < timeout:
-            # Send shutdown signals to all workers first
-            for _ in range(self.total_workers):
-                try:
-                    self.worker_job_queue.put(None)
-                except Exception as e:
-                    logger.error(f"{self.name}: Error sending shutdown signal: {e}")
-                logger.debug(f"{self.name}: Worker job queue size after signals: {self.worker_job_queue.qsize()}")
-
-            # Wait for workers to process signals
+        logger.info(f"{self.name}: Workers alive: {len(self.workers)}, Stats: {dict(self.worker_stats)}")
+        logger.info(f"{self.name}: Queue sizes - worker_job: {self.worker_job_queue.qsize()}, result: {self.result_queue.qsize()}")
+        
+        # 1. Send shutdown signals
+        num_signals = len(self.workers)
+        logger.info(f"{self.name}: Sending {num_signals} shutdown signals")
+        for i in range(num_signals):
+            try:
+                self.worker_job_queue.put(None, timeout=1)
+                logger.info(f"{self.name}: Sent shutdown signal {i+1}/{num_signals}")
+            except:
+                logger.info(f"{self.name}: Failed to send shutdown signal {i+1}")
+        
+        # 2. Wait for workers to exit gracefully
+        logger.info(f"{self.name}: Waiting for workers to exit gracefully (timeout={timeout}s)")
+        start = time()
+        for pid, process in list(self.workers.items()):
+            remaining = timeout - (time() - start)
+            if remaining <= 0:
+                logger.info(f"{self.name}: Timeout reached, {len(self.workers)} workers still alive")
+                break
+            logger.info(f"{self.name}: Waiting for worker {pid} (remaining={remaining:.1f}s)")
+            process.join(timeout=min(remaining, 2))
+            if not process.is_alive():
+                logger.info(f"{self.name}: Worker {pid} exited cleanly")
+                del self.workers[pid]
+            else:
+                logger.info(f"{self.name}: Worker {pid} still alive after join")
+        
+        logger.info(f"{self.name}: After graceful wait: {len(self.workers)} workers still alive")
+        
+        # 3. Force terminate stragglers
+        if self.workers:
+            logger.info(f"{self.name}: Force terminating {len(self.workers)} remaining workers")
             for pid, process in list(self.workers.items()):
                 if process.is_alive():
-                    logger.debug(f"{self.name}: Worker {pid} still alive, waiting...")
-                    process.join(timeout=0.1)
-                else:
-                    del self.workers[pid]
-            sleep(0.1)
+                    logger.info(f"{self.name}: Terminating worker {pid}")
+                    process.terminate()
+                    process.join(timeout=2)
+                    if process.is_alive():
+                        logger.info(f"{self.name}: Killing worker {pid}")
+                        process.kill()
+                        process.join(timeout=1)
+            self.workers.clear()
+            logger.info(f"{self.name}: All workers terminated")
         
-        items = []
-        while not self.worker_job_queue.empty():
+        # 4. Drain queues
+        logger.info(f"{self.name}: Draining result queue (size={self.result_queue.qsize()})")
+        drained = 0
+        while not self.result_queue.empty():
             try:
-                items.append(self.worker_job_queue.get_nowait())
+                self.result_queue.get_nowait()
+                drained += 1
             except:
                 break
-        logger.info(f"{self.name}: queue: {items}")
+        logger.info(f"{self.name}: Drained {drained} results from queue")
+        
+        # 5. Close queues
+        logger.info(f"{self.name}: Closing queues")
+        self.worker_job_queue.cancel_join_thread()
+        self.result_queue.cancel_join_thread()
+        self.worker_job_queue.close()
+        self.result_queue.close()
+        logger.info(f"{self.name}: Queues closed")
+        
+        # 6. Shutdown manager
+        logger.info(f"{self.name}: Shutting down multiprocessing manager")
+        self.mp_manager.shutdown()
+        logger.info(f"{self.name}: Manager shutdown complete")
+        
+        logger.info(f"{self.name}: shutdown complete - Final stats: {dict(self.worker_stats)}")
 
-        # Force terminate any remaining workers
+
+    def shutdown2(self, timeout=30):
+        """Shutdown all workers and clean up resources"""
+        logger.info(f"{self.name}: Initiating LazyWorkerPool shutdown")
+        
+        # 1. Send shutdown signals (one per worker)
+        num_signals = len(self.workers)
+        for _ in range(num_signals):
+            try:
+                self.worker_job_queue.put(None, timeout=1)
+            except:
+                pass
+        
+        # 2. Wait for workers to exit gracefully
+        start = time()
+        for pid, process in list(self.workers.items()):
+            remaining = timeout - (time() - start)
+            if remaining <= 0:
+                break
+            process.join(timeout=min(remaining, 2))
+            if not process.is_alive():
+                del self.workers[pid]
+        
+        # 3. Force terminate stragglers
         for pid, process in list(self.workers.items()):
             if process.is_alive():
-                logger.warning(f"{self.name}: Force terminating worker")
+                logger.warning(f"{self.name}: Force terminating worker {pid}")
                 process.terminate()
-                try:
-                    process.join(timeout=2)
-                except:
+                process.join(timeout=2)
+                if process.is_alive():
                     process.kill()
         self.workers.clear()
-
-        # Close queues
-        try:
-            self.worker_job_queue.close()
-            self.result_queue.close()
-        except Exception as e:
-            logger.error(f"{self.name}: Error closing queues: {e}")
-
-        # Shutdown the manager
-        logger.debug(f"{self.name}: Stats after: {self.worker_stats}")
-        try:
-            self.mp_manager.shutdown()
-            # Wait for the manager process to terminate gracefully
-            self.mp_manager.join(timeout=2)
-        except Exception as e:
-            logger.error(f"{self.name}: Error shutting down manager: {e}")
-            # Force kill if still alive
+        
+        # 4. Drain queues BEFORE closing
+        while not self.result_queue.empty():
             try:
-                if hasattr(self.mp_manager, '_process') and self.mp_manager._process.is_alive():
-                    self.mp_manager._process.terminate()
-                    self.mp_manager._process.join(timeout=1)
-                    if self.mp_manager._process.is_alive():
-                        self.mp_manager._process.kill()
-            except Exception as e:
-                logger.error(f"{self.name}: Force-killing manager: {e}")
-
-        logger.debug(f"{self.name}: Worker job queue size after: {self.worker_job_queue.qsize()}")
-        logger.debug(f"{self.name}: Result queue size after: {self.result_queue.qsize()}")
-        logger.info(f"{self.name}: shutdown complete")
-    
+                self.result_queue.get_nowait()
+            except:
+                break
+        
+        # 5. Close queues properly
+        self.worker_job_queue.cancel_join_thread()
+        self.result_queue.cancel_join_thread()
+        self.worker_job_queue.close()
+        self.result_queue.close()
+        
+        # 6. Shutdown manager
+        self.mp_manager.shutdown()
+        
+        logger.info(f"{self.name}: shutdown complete")    
 
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
@@ -416,9 +469,17 @@ class ResourceAwareScheduler:
             
         logger.info("Initiating scheduler shutdown")
         self.running = False
-        zombie_reaping() # i.ex dataloader may spawn many threads
+        
+        # Wait for scheduler loop to exit FIRST (don't close queue yet!)
+        if self.scheduler_thread and self.scheduler_thread.is_alive():
+            logger.info("Waiting for scheduler thread to terminate")
+            self.scheduler_thread.join(timeout=10)
+            if self.scheduler_thread.is_alive():
+                logger.warning("Scheduler thread did not terminate within timeout")
+        
+        zombie_reaping()
 
-        # Close job queue first to prevent new jobs
+        # NOW close job queue after scheduler loop is done
         try:
             self.job_queue.close()
             self.job_queue.cancel_join_thread()
@@ -431,17 +492,6 @@ class ResourceAwareScheduler:
             self.gpu_worker_pool.shutdown()
         except Exception as e:
             logger.error(f"Error shutting down worker pool: {e}")
-        
-        # Wait for scheduler loop to exit
-        if self.scheduler_thread and self.scheduler_thread.is_alive():
-            try:
-                logger.info("Waiting for scheduler thread to terminate")
-                self.scheduler_thread.join(timeout=10)
-                if self.scheduler_thread.is_alive():
-                    logger.warning("Scheduler thread did not terminate within timeout")
-            except Exception as e:
-                logger.error(f"Error stopping scheduler thread: {e}")
-                raise
 
         logger.info("Scheduler shutdown complete")
 
@@ -580,7 +630,7 @@ class ResourceAwareScheduler:
                 if (self.completed_count - self.last_completed_count >= self.scaling_threshold) and self.running:
                     self._adjust_concurrency()
 
-                if (self.jobs_in_queue == 0) and (self.jobs_in_flight == 0):
+                if self.completed_count >= self.total_queued_jobs:
                     self.running = False
                 else:
                     sleep(self.scheduler_loop_delay)
@@ -590,7 +640,6 @@ class ResourceAwareScheduler:
         finally:
             logger.info("Scheduler loop exiting")
             self.running = False
-            sys.exit(0)
 
 def generic_parallel_grid_search(
     # Core parameters
@@ -664,6 +713,7 @@ def generic_parallel_grid_search(
                                 pbar.update(current_count - last_count)
                                 last_count = current_count
                             sleep(0.5)
+                        pbar.close() # TODO remove (context manager handles this)
                 
                 if scheduler.completed_count == total_jobs:
                     elapsed_time = time() - start_time
