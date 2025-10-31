@@ -694,38 +694,29 @@ def generic_parallel_grid_search(
                 with logging_redirect_tqdm():
                     with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
                         last_count = 0
-                        while scheduler.completed_count < total_jobs and scheduler.running:
+                        while last_count < total_jobs and scheduler.running:
                             current_count = scheduler.completed_count
-                            if current_count > last_count:
-                                pbar.update(current_count - last_count)
-                                last_count = current_count
+                            pbar.update(current_count - last_count)
+                            last_count = current_count
                             sleep(0.5)
                 
                 if scheduler.completed_count == total_jobs:
                     elapsed_time = time() - start_time
                     logger.info(f"Grid search completed in {elapsed_time:.1f}s")
                 logger.info("Exiting scheduler context manager")
-                sleep(3)
                     
             # Extract results from shared state
-            logger.info("Scheduler shutdown complete")
-            sleep(3)
-
             shared = job_generator.shared 
             locks = job_generator.locks
             with locks.get('history', locks):
                 history = deepcopy(list(shared.get('history', [])))
-                # Process results with provided callback
-                logger.info(f"Active threads before sleep: {threading.active_count()}")
-                sleep(3)
-                logger.info(f"Active threads before processing: {threading.active_count()}")
-                process_results(history, best_params, output_path)
-                logger.info(f"Saved {len(history)} results to {output_path}")
-
+            with locks.get('best_params', locks):
+                best_params = dict(shared.get('best_params', {}))
             logger.info("Exiting job generator context manager")
 
-        logger.info("Job generator context exited")
-
+        # Process results with provided callback
+        process_results(history, best_params, output_path)
+        logger.info(f"Saved {len(history)} results to {output_path}")
         
         return history, best_params
                     
