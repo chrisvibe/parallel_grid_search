@@ -43,13 +43,7 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
             worker_registered = True
         
         while True:
-            # Worker is IDLE while waiting for jobs
-            job_data = None
-            try:
-                job_data = job_queue.get(timeout=10)
-            except queue.Empty:
-                break
-                    
+            job_data = job_queue.get()
             if job_data is None:  # Shutdown signal
                 break
                 
@@ -106,8 +100,18 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                         worker_stats['jobs_completed'] += 1
                     else:
                         worker_stats['jobs_failed'] += 1
+                if 'job' in locals() and hasattr(job, 'cleanup'):
+                    try:
+                        job.cleanup()
+                    except Exception as e:
+                        logger.error(f"Job cleanup error: {e}")
     except KeyboardInterrupt:
         logger.info("Worker received KeyboardInterrupt, shutting down")
+    except ValueError as e:
+        if "is closed" in str(e):
+            logger.debug("Job queue closed, worker exiting")
+        else:
+            raise
     except Exception as e:
         logger.exception(f"Worker error: {e}")
     finally:
@@ -115,6 +119,15 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
         if worker_registered:
             with stats_lock:
                 worker_stats['idle'] -= 1  # Worker was idle when it shut down
+        # New: Additional cleanup for sub-resources (adapt to your job specifics)
+        try:
+            zombie_reaping()  # Global reap, in case any stragglers
+            # If job.run() uses DataLoader or similar, ensure shutdown here (example for PyTorch)
+            # if 'dataloader' in locals() and hasattr(dataloader, '_shutdown_workers'):
+            #     dataloader._shutdown_workers()
+            # Or if job has a cleanup method: job.cleanup() if 'job' in locals() else pass
+        except Exception as e:
+            logger.error(f"Cleanup error in worker: {e}")
         logger.info("Worker shut down")
 
 def zombie_reaping():
@@ -137,8 +150,10 @@ class LazyWorkerPool:
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
         self.process_priority = process_priority
-        self.worker_job_queue = Queue()
-        self.result_queue = Queue()
+        # self.worker_job_queue = Queue()
+        # self.result_queue = Queue()
+        self.worker_job_queue = mp.Queue()
+        self.result_queue = mp.Queue()
         self.spawn_delay = spawn_rate 
         
         # Each pool gets its OWN manager
@@ -269,23 +284,17 @@ class LazyWorkerPool:
                 logger.info(f"{self.name}: Sent shutdown signal {i+1}/{num_signals}")
             except:
                 logger.info(f"{self.name}: Failed to send shutdown signal {i+1}")
-        
+
         # 2. Wait for workers to exit gracefully
         logger.info(f"{self.name}: Waiting for workers to exit gracefully (timeout={timeout}s)")
-        start = time()
-        for pid, process in list(self.workers.items()):
-            remaining = timeout - (time() - start)
-            if remaining <= 0:
-                logger.info(f"{self.name}: Timeout reached, {len(self.workers)} workers still alive")
-                break
-            logger.info(f"{self.name}: Waiting for worker {pid} (remaining={remaining:.1f}s)")
-            process.join(timeout=min(remaining, 2))
-            if not process.is_alive():
-                logger.info(f"{self.name}: Worker {pid} exited cleanly")
-                del self.workers[pid]
-            else:
-                logger.info(f"{self.name}: Worker {pid} still alive after join")
-        
+        start = time.time()
+        while self.workers and (time.time() - start) < timeout:
+            for pid, process in list(self.workers.items()):
+                process.join(timeout=0.5)  # Small per-join timeout to check frequently
+                if not process.is_alive():
+                    logger.info(f"{self.name}: Worker {pid} exited cleanly")
+                    del self.workers[pid]
+            time.sleep(0.1)  # Brief pause to avoid CPU spin
         logger.info(f"{self.name}: After graceful wait: {len(self.workers)} workers still alive")
         
         # 3. Force terminate stragglers
@@ -321,70 +330,14 @@ class LazyWorkerPool:
         self.worker_job_queue.close()
         self.result_queue.close()
         logger.info(f"{self.name}: Queues closed")
-        
+                
         # 6. Shutdown manager
         logger.info(f"{self.name}: Final stats before manager shutdown: {dict(self.worker_stats)}")
         logger.info(f"{self.name}: Shutting down multiprocessing manager")
         self.mp_manager.shutdown()
         logger.info(f"{self.name}: Manager shutdown complete")
-        try:
-            self.mp_manager.shutdown()
-            logger.info(f"{self.name}: Manager shutdown complete")
-        except Exception as e:
-            logger.error(f"{self.name}: Manager shutdown failed: {e}")
-            raise
 
         logger.info(f"{self.name}: shutdown complete")
-
-    def shutdown2(self, timeout=30):
-        """Shutdown all workers and clean up resources"""
-        logger.info(f"{self.name}: Initiating LazyWorkerPool shutdown")
-        
-        # 1. Send shutdown signals (one per worker)
-        num_signals = len(self.workers)
-        for _ in range(num_signals):
-            try:
-                self.worker_job_queue.put(None, timeout=1)
-            except:
-                pass
-        
-        # 2. Wait for workers to exit gracefully
-        start = time()
-        for pid, process in list(self.workers.items()):
-            remaining = timeout - (time() - start)
-            if remaining <= 0:
-                break
-            process.join(timeout=min(remaining, 2))
-            if not process.is_alive():
-                del self.workers[pid]
-        
-        # 3. Force terminate stragglers
-        for pid, process in list(self.workers.items()):
-            if process.is_alive():
-                logger.warning(f"{self.name}: Force terminating worker {pid}")
-                process.terminate()
-                process.join(timeout=2)
-                if process.is_alive():
-                    process.kill()
-        self.workers.clear()
-        
-        # 4. Drain queues BEFORE closing
-        while not self.result_queue.empty():
-            try:
-                self.result_queue.get_nowait()
-            except:
-                break
-        
-        # 5. Close queues properly
-        self.worker_job_queue.cancel_join_thread()
-        self.result_queue.cancel_join_thread()
-        self.worker_job_queue.close()
-        self.result_queue.close()
-        
-        # 6. Shutdown manager
-        self.mp_manager.shutdown()
-        
-        logger.info(f"{self.name}: shutdown complete")    
 
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
@@ -480,13 +433,17 @@ class ResourceAwareScheduler:
         # Wait for scheduler loop to exit FIRST
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             logger.info("Waiting for scheduler thread to terminate")
-            self.scheduler_thread.join(timeout=10)
+            self.scheduler_thread.join()
             if self.scheduler_thread.is_alive():
                 logger.warning("Scheduler thread did not terminate within timeout")
+            else:
+                logger.info("Scheduler thread terminated successfully")
         
         logger.info("Scheduler thread joined, starting cleanup")
         zombie_reaping()
         logger.info("Zombie reaping complete")
+        if self.jobs_in_flight > 0:
+            logger.warning(f"Unexpected: {self.jobs_in_flight} jobs still in flight after drain")
 
         # Close job queue
         try:
@@ -499,13 +456,14 @@ class ResourceAwareScheduler:
 
         # Delegate worker pool shutdown
         try:
+            logger.info(f"CPU worker pool state: workers={len(self.cpu_worker_pool.workers)}, stats={dict(self.cpu_worker_pool.worker_stats)}")
             logger.info("Shutting down CPU worker pool")
-            self.cpu_worker_pool.shutdown()
+            self.cpu_worker_pool.shutdown(timeout=None)
             logger.info("CPU worker pool shutdown complete")
             
             logger.info(f"GPU worker pool state: workers={len(self.gpu_worker_pool.workers)}, stats={dict(self.gpu_worker_pool.worker_stats)}")
             logger.info("Shutting down GPU worker pool")
-            self.gpu_worker_pool.shutdown()
+            self.gpu_worker_pool.shutdown(timeout=None)
             logger.info("GPU worker pool shutdown complete")
         except Exception as e:
             logger.error(f"Error shutting down worker pool: {e}")
@@ -565,6 +523,8 @@ class ResourceAwareScheduler:
         self.resource_manager.release_resources(device)
 
     def _schedule_jobs(self, n_jobs=1):
+        if not self.running:
+            return
         for _ in range(n_jobs):
             try:
                 job = self.job_queue.get(timeout=0.1)
@@ -637,9 +597,9 @@ class ResourceAwareScheduler:
                     self._schedule_jobs(n_jobs=n_jobs)
 
                 for worker_pool in self.worker_pools.values():
-                    while self.running:
+                    while True:
                         result = worker_pool.get_result(timeout=0.1)
-                        if result is None or not self.running:
+                        if result is None:
                             break
                         self._handle_job_completion(result)
 
@@ -655,7 +615,15 @@ class ResourceAwareScheduler:
         except Exception as e:
             logger.exception(f"Scheduler loop error: {e}")
         finally:
-            logger.info("Scheduler loop exiting")
+            logger.info("Scheduler loop exiting - draining remaining results")
+            # New: Drain all remaining results unconditionally
+            while self.jobs_in_flight > 0:
+                for worker_pool in self.worker_pools.values():
+                    result = worker_pool.get_result(timeout=1.0)  # Longer timeout for drain
+                    if result is not None:
+                        self._handle_job_completion(result)
+                zombie_reaping()  # Keep cleaning up
+                sleep(0.1)  # Brief sleep to avoid tight loop
             self.running = False
 
 def generic_parallel_grid_search(
@@ -705,13 +673,13 @@ def generic_parallel_grid_search(
         gpu_memory_per_job_gb=gpu_memory_per_job_gb,
     )
 
+    history = best_params = None
+
     try:
         with GenericJobGenerator(job_factory=job_factory,
                                  total_configs=total_configs,
                                  samples_per_config=samples_per_config,
         ) as job_generator:
-            history = None
-            best_params = None
             with ResourceAwareScheduler(resource_manager=resource_manager) as scheduler:
                 total_jobs = len(job_generator)
                 logger.info(f"Submitting {total_jobs} jobs to scheduler")
@@ -746,7 +714,7 @@ def generic_parallel_grid_search(
             shared = job_generator.shared 
             locks = job_generator.locks
             with locks.get('history', locks):
-                history = list(shared.get('history', []))
+                history = deepcopy(list(shared.get('history', [])))
                 # Process results with provided callback
                 logger.info(f"Active threads before sleep: {threading.active_count()}")
                 sleep(3)

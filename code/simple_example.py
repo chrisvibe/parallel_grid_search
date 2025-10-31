@@ -312,6 +312,9 @@ def simple_parallel_grid_search(
             print(f"\nBest configuration found:")
             print(f"Loss: {best_params['loss']:.6f}")
             print(f"Parameters: {best_params['params'].__dict__}")
+        
+    def cleanup():
+        pass
     
     # Run the generic parallel grid search
     logger.info("Starting parallel grid search...")
