@@ -13,6 +13,7 @@ from typing import Tuple, Callable, List, Dict, Any
 from projects.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
 import errno
 from os import waitpid, WNOHANG
+from copy import deepcopy
 
 import logging
 logger = logging.getLogger(__name__)
@@ -322,12 +323,18 @@ class LazyWorkerPool:
         logger.info(f"{self.name}: Queues closed")
         
         # 6. Shutdown manager
+        logger.info(f"{self.name}: Final stats before manager shutdown: {dict(self.worker_stats)}")
         logger.info(f"{self.name}: Shutting down multiprocessing manager")
         self.mp_manager.shutdown()
         logger.info(f"{self.name}: Manager shutdown complete")
-        
-        logger.info(f"{self.name}: shutdown complete - Final stats: {dict(self.worker_stats)}")
+        try:
+            self.mp_manager.shutdown()
+            logger.info(f"{self.name}: Manager shutdown complete")
+        except Exception as e:
+            logger.error(f"{self.name}: Manager shutdown failed: {e}")
+            raise
 
+        logger.info(f"{self.name}: shutdown complete")
 
     def shutdown2(self, timeout=30):
         """Shutdown all workers and clean up resources"""
@@ -461,7 +468,7 @@ class ResourceAwareScheduler:
         gpu_delta = self.gpu_worker_pool.scale_workers_to(target_gpu)
         cpu_delta = self.cpu_worker_pool.scale_workers_to(target_cpu)
         return gpu_delta + cpu_delta, target_gpu + target_cpu 
-    
+
     def stop(self):
         """Stop the scheduler and clean up all resources"""
         if not self.running:
@@ -470,26 +477,36 @@ class ResourceAwareScheduler:
         logger.info("Initiating scheduler shutdown")
         self.running = False
         
-        # Wait for scheduler loop to exit FIRST (don't close queue yet!)
+        # Wait for scheduler loop to exit FIRST
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             logger.info("Waiting for scheduler thread to terminate")
             self.scheduler_thread.join(timeout=10)
             if self.scheduler_thread.is_alive():
                 logger.warning("Scheduler thread did not terminate within timeout")
         
+        logger.info("Scheduler thread joined, starting cleanup")
         zombie_reaping()
+        logger.info("Zombie reaping complete")
 
-        # NOW close job queue after scheduler loop is done
+        # Close job queue
         try:
+            logger.info("Closing job queue")
             self.job_queue.close()
             self.job_queue.cancel_join_thread()
+            logger.info("Job queue closed")
         except Exception as e:
             logger.error(f"Error closing job queue: {e}")
 
         # Delegate worker pool shutdown
         try:
+            logger.info("Shutting down CPU worker pool")
             self.cpu_worker_pool.shutdown()
+            logger.info("CPU worker pool shutdown complete")
+            
+            logger.info(f"GPU worker pool state: workers={len(self.gpu_worker_pool.workers)}, stats={dict(self.gpu_worker_pool.worker_stats)}")
+            logger.info("Shutting down GPU worker pool")
             self.gpu_worker_pool.shutdown()
+            logger.info("GPU worker pool shutdown complete")
         except Exception as e:
             logger.error(f"Error shutting down worker pool: {e}")
 
@@ -693,6 +710,8 @@ def generic_parallel_grid_search(
                                  total_configs=total_configs,
                                  samples_per_config=samples_per_config,
         ) as job_generator:
+            history = None
+            best_params = None
             with ResourceAwareScheduler(resource_manager=resource_manager) as scheduler:
                 total_jobs = len(job_generator)
                 logger.info(f"Submitting {total_jobs} jobs to scheduler")
@@ -713,26 +732,34 @@ def generic_parallel_grid_search(
                                 pbar.update(current_count - last_count)
                                 last_count = current_count
                             sleep(0.5)
-                        pbar.close() # TODO remove (context manager handles this)
                 
                 if scheduler.completed_count == total_jobs:
                     elapsed_time = time() - start_time
                     logger.info(f"Grid search completed in {elapsed_time:.1f}s")
+                logger.info("Exiting scheduler context manager")
+                sleep(3)
                     
             # Extract results from shared state
-            history = None
-            best_params = None
+            logger.info("Scheduler shutdown complete")
+            sleep(3)
 
             shared = job_generator.shared 
             locks = job_generator.locks
             with locks.get('history', locks):
                 history = list(shared.get('history', []))
-            
-            # Process results with provided callback
-            process_results(history, best_params, output_path)
-            logger.info(f"Saved {len(history)} results to {output_path}")
-            
-            return history, best_params
+                # Process results with provided callback
+                logger.info(f"Active threads before sleep: {threading.active_count()}")
+                sleep(3)
+                logger.info(f"Active threads before processing: {threading.active_count()}")
+                process_results(history, best_params, output_path)
+                logger.info(f"Saved {len(history)} results to {output_path}")
+
+            logger.info("Exiting job generator context manager")
+
+        logger.info("Job generator context exited")
+
+        
+        return history, best_params
                     
     except KeyboardInterrupt:
         logger.info("Main function received KeyboardInterrupt, ensuring cleanup")

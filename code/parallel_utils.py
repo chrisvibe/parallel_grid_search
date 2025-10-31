@@ -97,28 +97,27 @@ class GenericJobGenerator:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cleanup()
         return False
-    
+
     def cleanup(self):
         """Clean up multiprocessing resources"""
         try:
-            # Clear shared objects - use del or slice assignment for proxies
-            if 'best_params' in self.shared:
-                self.shared['best_params'].clear()  # Clear dict proxy
-            if 'history' in self.shared:
-                del self.shared['history'][:]  # Clear list proxy
+            logger.info("Job generator cleanup starting")
             
-            # Clear references
+            # Clear local references
+            logger.info("Clearing shared dict")
             self.shared.clear()
+            logger.info("Clearing locks dict")
             self.locks.clear()
             
             # Shutdown the manager
             if hasattr(self, 'mp_manager'):
+                logger.info("Shutting down job generator manager")
                 self.mp_manager.shutdown()
+                logger.info("Job generator manager shutdown complete")
                 
         except Exception as e:
             logger.error(f"Error during job generator cleanup: {e}")
-
-
+    
 def grouped_bar_graph(values, width=32):
     """Create a compact bar graph"""
     def bar_graph(values):
