@@ -57,7 +57,7 @@ class JobInterface(ABC):
 class GenericJobGenerator:
     """Generic job generator that can create any type of job"""
     
-    def __init__(self, job_factory, total_configs: int, samples_per_config: int):
+    def __init__(self, manager, job_factory, total_configs: int, samples_per_config: int):
         """
         job_factory: A callable that takes (i, j, total_configs, total_samples, shared, locks) and returns a job
         """
@@ -65,7 +65,7 @@ class GenericJobGenerator:
         self.total_configs = total_configs
         self.samples_per_config = samples_per_config
 
-        self.mp_manager = mp.Manager()
+        self.mp_manager = manager 
         self.shared = {
             'best_params': self.mp_manager.dict({'loss': None, 'params': None}),
             'history': self.mp_manager.list(),
@@ -104,17 +104,11 @@ class GenericJobGenerator:
             logger.info("Job generator cleanup starting")
             
             # Clear local references
-            logger.info("Clearing shared dict")
-            self.shared.clear()
-            logger.info("Clearing locks dict")
-            self.locks.clear()
+            # logger.info("Clearing shared dict")
+            # self.shared.clear()
+            # logger.info("Clearing locks dict")
+            # self.locks.clear()
             
-            # Shutdown the manager
-            if hasattr(self, 'mp_manager'):
-                logger.info("Shutting down job generator manager")
-                self.mp_manager.shutdown()
-                logger.info("Job generator manager shutdown complete")
-                
         except Exception as e:
             logger.error(f"Error during job generator cleanup: {e}")
     
