@@ -2,10 +2,9 @@ from pathlib import Path
 from time import sleep, time
 import queue
 import torch.multiprocessing as mp
-from torch.multiprocessing import Process, Queue
+from torch.multiprocessing import Process
 from torch import set_num_threads, set_num_interop_threads
 import psutil
-import pandas as pd
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 import threading
@@ -13,7 +12,6 @@ from typing import Tuple, Callable, List, Dict, Any
 from projects.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
 import errno
 from os import waitpid, WNOHANG
-from copy import deepcopy
 
 if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method('spawn')
@@ -216,9 +214,9 @@ class LazyWorkerPool:
                 current += 1
                 added += 1
                 
-                logger.info(f"{self.name}: Scaled up {added} workers...")
+                logger.debug(f"{self.name}: Scaled up {added} workers...")
             else:
-                logger.info(f"{self.name}: Avoided scale up due to idle workers...")
+                logger.debug(f"{self.name}: Avoided scale up due to idle workers...")
             
             sleep(self.spawn_delay)
         
@@ -273,10 +271,12 @@ class LazyWorkerPool:
         self.result_queue.close()
         
         # Wait briefly for daemon workers (they'll die with main process anyway)
+        logger.debug(f"{self.name}: shutdown workers")
         for pid, process in list(self.workers.items()):
             process.join(timeout=0.5)
+            logger.debug(f"{self.name}:{pid} killed")
         
-            logger.info(f"{self.name}: shutdown complete")
+        logger.info(f"{self.name}: shutdown complete")
 
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
@@ -294,7 +294,7 @@ class ResourceAwareScheduler:
         self.worker_pools = {'cpu': self.cpu_worker_pool, 'gpu': self.gpu_worker_pool}
         
         # Job tracking
-        self.job_queue = Queue()
+        self.job_queue = mp.Queue()
         self.job_completion_times = []  # Circular buffer for completion times
         self.max_completion_history = 20
         self.total_queued_jobs = 0
@@ -394,8 +394,10 @@ class ResourceAwareScheduler:
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
-        return False
+       if exc_type is not None:
+           logger.error(f"Exiting due to exception: {exc_type.__name__}: {exc_val}")
+       self.stop()
+       return False
 
     def add_job(self, job):
         """Add job to queue"""
@@ -596,41 +598,41 @@ def generic_parallel_grid_search(
     history = best_params = None
 
     try:
-        with GenericJobGenerator(manager=manager,
+        job_generator = GenericJobGenerator(manager=manager,
                                  job_factory=job_factory,
                                  total_configs=total_configs,
                                  samples_per_config=samples_per_config,
-        ) as job_generator:
-            with ResourceAwareScheduler(resource_manager=resource_manager, manager=manager) as scheduler:
-                total_jobs = len(job_generator)
-                logger.info(f"Submitting {total_jobs} jobs to scheduler")
+                                 )
+        with ResourceAwareScheduler(resource_manager=resource_manager, manager=manager) as scheduler:
+            total_jobs = len(job_generator)
+            logger.info(f"Submitting {total_jobs} jobs to scheduler")
+            
+            for job in job_generator:
+                scheduler.add_job(job)
+            
+            scheduler.start()
+            
+            # Wait for completion
+            start_time = time()
+            with logging_redirect_tqdm():
+                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
+                    last_count = 0
+                    while last_count < total_jobs and scheduler.running:
+                        current_count = scheduler.completed_count
+                        pbar.update(current_count - last_count)
+                        last_count = current_count
+                        sleep(0.5)
+            
+            if scheduler.completed_count == total_jobs:
+                elapsed_time = time() - start_time
+                logger.info(f"Grid search completed in {elapsed_time:.1f}s")
+            logger.info("Exiting scheduler context manager")
                 
-                for job in job_generator:
-                    scheduler.add_job(job)
-                
-                scheduler.start()
-                
-                # Wait for completion
-                start_time = time()
-                with logging_redirect_tqdm():
-                    with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
-                        last_count = 0
-                        while last_count < total_jobs and scheduler.running:
-                            current_count = scheduler.completed_count
-                            pbar.update(current_count - last_count)
-                            last_count = current_count
-                            sleep(0.5)
-                
-                if scheduler.completed_count == total_jobs:
-                    elapsed_time = time() - start_time
-                    logger.info(f"Grid search completed in {elapsed_time:.1f}s")
-                logger.info("Exiting scheduler context manager")
-                    
             # Extract results from shared state
             shared = job_generator.shared 
             locks = job_generator.locks
             with locks.get('history', locks):
-                history = deepcopy(list(shared.get('history', [])))
+                history = list(shared.get('history', []))
             with locks.get('best_params', locks):
                 best_params = dict(shared.get('best_params', {}))
             logger.info("Exiting job generator context manager")

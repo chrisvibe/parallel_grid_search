@@ -4,12 +4,9 @@ import pynvml
 import torch
 from collections import defaultdict, deque
 from os import environ, sched_getaffinity, cpu_count
-import torch.multiprocessing as mp
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 import numpy as np
-import pandas as pd
-import pathlib as Path
 
 import logging
 logger = logging.getLogger(__name__)
@@ -90,27 +87,6 @@ class GenericJobGenerator:
     
     def __len__(self):
         return self.total_configs * self.samples_per_config
-
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
-        return False
-
-    def cleanup(self):
-        """Clean up multiprocessing resources"""
-        try:
-            logger.info("Job generator cleanup starting")
-            
-            # Clear local references
-            # logger.info("Clearing shared dict")
-            # self.shared.clear()
-            # logger.info("Clearing locks dict")
-            # self.locks.clear()
-            
-        except Exception as e:
-            logger.error(f"Error during job generator cleanup: {e}")
     
 def grouped_bar_graph(values, width=32):
     """Create a compact bar graph"""
@@ -656,7 +632,7 @@ class GPUJobResourceManager:
     def _perform_reset(self, gpu_id):
         """Clear GPU memory and reset state"""
         try:
-            logger.info(f"Resetting GPU {gpu_id}")
+            logger.debug(f"Resetting GPU {gpu_id}")
             
             # Clear GPU memory
             with torch.cuda.device(gpu_id):
@@ -673,7 +649,7 @@ class GPUJobResourceManager:
             # Reset flags
             self.gpu_reset_pending[gpu_id] = False
             
-            logger.info(f"GPU {gpu_id} reset complete")
+            logger.debug(f"GPU {gpu_id} reset complete")
             
         except Exception as e:
             logger.error(f"Resetting GPU {gpu_id}: {e}")
