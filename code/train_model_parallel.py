@@ -461,26 +461,18 @@ class ResourceAwareScheduler:
                 pass
 
     def _try_schedule_job(self, job):
-        """Try to schedule a single job, returns True if scheduled, False otherwise"""
         device = self.resource_manager.try_allocate_resources()
-
-        if device is not None:
-            is_gpu = device.type == 'cuda'
-            try:
-                logger.debug(f"Scheduled job on device {device}")
-                if is_gpu:
-                    self.gpu_worker_pool.submit_job(job, device)
-                else:
-                    self.cpu_worker_pool.submit_job(job, device)
-                
-                return True
-                
-            except Exception as e:
-                # Job submission failed - must release resources
-                logger.error(f"Failed to submit job, releasing resources: {e}")
-                self.resource_manager.release_resources(device)
-                return False
-        return False
+        if device is None:
+            return False
+        
+        pool = self.gpu_worker_pool if device.type == 'cuda' else self.cpu_worker_pool
+        try:
+            pool.submit_job(job, device)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to submit job: {e}")
+            self.resource_manager.release_resources(device)
+            return False
 
     def _adjust_concurrency(self):
         """Adjust concurrency based on completion rate and system resources"""

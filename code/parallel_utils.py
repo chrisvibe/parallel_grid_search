@@ -358,6 +358,11 @@ class GPUJobResourceManager:
 
         # Track utilization by concurrency level
         self.concurrency_performance = defaultdict(lambda: defaultdict(lambda: {'ewma': 0.0}))
+
+        # other thresholds
+        self.avg_memory_util_thresh = 0.85
+        self.low_avg_compute_util_threash = 0.1
+        self.high_avg_compute_util_threash = 0.9
         
         self._init_slurm_gpus()
         self._init_pynvml()
@@ -522,7 +527,7 @@ class GPUJobResourceManager:
             required_memory_bytes = (self.memory_per_job_gb * 1024**3) + (self.buffer_mb * 1024**2)
             
             # Don't allocate if average usage too high
-            if avg_memory_util > 0.85:
+            if avg_memory_util > self.avg_memory_util_thresh:
                 return False
                 
             return mem_free >= required_memory_bytes
@@ -544,7 +549,7 @@ class GPUJobResourceManager:
             mem_total, mem_used, mem_free, avg_memory_util = self._get_gpu_memory_info(gpu_id)
             required_memory_bytes = (self.memory_per_job_gb * 1024**3) + (self.buffer_mb * 1024**2)
             
-            if avg_memory_util > 0.85 or mem_free < required_memory_bytes:
+            if avg_memory_util > self.avg_memory_util_thresh or mem_free < required_memory_bytes:
                 return False
                 
         except Exception as e:
@@ -555,7 +560,7 @@ class GPUJobResourceManager:
         _, avg_compute_util = self._get_gpu_compute_utilization(gpu_id)
         
         # Only increase if compute utilization is moderate (not too low, not too high)
-        return 0.1 < avg_compute_util <= 0.9
+        return self.low_avg_compute_util_threash < avg_compute_util <= self.high_avg_compute_util_threash
 
     def should_decrease_concurrency(self, gpu_id):
         """Check if we should decrease concurrency on this GPU"""
