@@ -15,6 +15,9 @@ import errno
 from os import waitpid, WNOHANG
 from copy import deepcopy
 
+if mp.get_start_method(allow_none=True) is None:
+    mp.set_start_method('spawn')
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -24,25 +27,24 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
     set_num_interop_threads(1)
     set_num_threads(cores_per_job)
     p = psutil.Process()
-    # Set process priority to prevent freezing and prioritized gpu jobs over cpu jobs
+    
+    # Set process priority
     try:
         p.nice(priority)
     except (psutil.AccessDenied, PermissionError):
         pass
-
-    worker_registered = False
+    
+    # Register worker as idle
+    with stats_lock:
+        worker_stats['idle'] += 1
+    
     try:
-        # Register worker as idle
-        with stats_lock:
-            worker_stats['idle'] += 1
-            worker_registered = True
-        
         while True:
             job_data = job_queue.get()
             if job_data is None:  # Shutdown signal
                 break
-                
-            # NOW we transition from idle -> busy (only when we have a job to execute)
+            
+            # Transition from idle -> busy
             with stats_lock:
                 worker_stats['idle'] -= 1
                 worker_stats['busy'] += 1
@@ -52,11 +54,11 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 job = job_data['job']
                 resources = job_data['resources']
                 device = resources['device']
-
-                # Run job (this is when we're actually "busy")
+                
+                # Run job
                 start_time = time()
                 result = job.run(device)
-                zombie_reaping() # i.ex dataloader may spawn many threads
+                zombie_reaping()
                 
                 # Add metadata
                 result.update({
@@ -74,7 +76,6 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 
             except Exception as e:
                 logger.exception(f"Job execution error: {e}")
-                # Send error result back
                 error_result = {
                     'status': 'error', 
                     'error_type': 'general', 
@@ -90,29 +91,29 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 with stats_lock:
                     worker_stats['busy'] -= 1
                     worker_stats['idle'] += 1
-                    # Only increment completed if job actually succeeded
                     if job_completed_successfully:
                         worker_stats['jobs_completed'] += 1
                     else:
                         worker_stats['jobs_failed'] += 1
+                
+                # Cleanup job if needed
                 if 'job' in locals() and hasattr(job, 'cleanup'):
                     try:
                         job.cleanup()
                     except Exception as e:
                         logger.error(f"Job cleanup error: {e}")
-
-                logger.info("Worker shut down")                
-
+    
     except KeyboardInterrupt:
-        logger.info("Worker received KeyboardInterrupt, shutting down")
+        logger.info("Worker received KeyboardInterrupt")
     except ValueError as e:
-        if "is closed" in str(e):
-            logger.debug("Job queue closed, worker exiting")
-        else:
-            raise
+        if "is closed" not in str(e):
+            logger.exception(f"Worker error: {e}")
     except Exception as e:
         logger.exception(f"Worker error: {e}")
     finally:
+        # Unregister worker
+        with stats_lock:
+            worker_stats['idle'] -= 1
         logger.info("Worker shut down")
 
 def zombie_reaping():
@@ -197,27 +198,30 @@ class LazyWorkerPool:
         """Add new workers up to max_workers limit"""
         added = 0
         current = self.total_workers
-        idle_count = self.idle_workers 
-
+        
         for _ in range(count):
             if current >= self.max_workers:
                 break
             
-            if idle_count == 0:
-                # Create new worker with shared state
+            # Only create if no idle workers
+            if self.idle_workers == 0:
                 p = Process(
                     target=worker_function,
-                    args=(self.worker_job_queue, self.result_queue, self.cores_per_job, self.process_priority, self.worker_stats, self.stats_lock)
+                    args=(self.worker_job_queue, self.result_queue, self.cores_per_job, 
+                        self.process_priority, self.worker_stats, self.stats_lock),
+                    daemon=True,
                 )
                 p.start()
                 self.workers[p.pid] = p
                 current += 1
                 added += 1
                 
-                logger.info(f"{self.name}: Scaled up {added} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
+                logger.info(f"{self.name}: Scaled up {added} workers...")
             else:
-                logger.info(f"{self.name}: Avoided scale up due to idle workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
+                logger.info(f"{self.name}: Avoided scale up due to idle workers...")
+            
             sleep(self.spawn_delay)
+        
         return added
 
     def scale_down_workers(self, count=1):
@@ -255,40 +259,24 @@ class LazyWorkerPool:
 
     def shutdown(self, timeout=30):
         """Shutdown all workers and clean up resources"""
-        logger.info(f"{self.name}: Initiating LazyWorkerPool shutdown")
-        logger.info(f"{self.name}: LazyWorkerPool.shutdown() called with {len(self.workers)} workers")
+        logger.info(f"{self.name}: Initiating shutdown")
         
-        # 1. Send shutdown signals
-        num_signals = len(self.workers)
-        for i in range(num_signals):
+        # Send shutdown signals
+        for _ in range(len(self.workers)):
             try:
-                self.worker_job_queue.put(None, timeout=1)
+                self.worker_job_queue.put(None, timeout=0.1)
             except:
                 pass
         
-        # 2. Close the queues to prevent new items
+        # Close queues
         self.worker_job_queue.close()
         self.result_queue.close()
         
-        # 3. Wait for workers with timeout
+        # Wait briefly for daemon workers (they'll die with main process anyway)
         for pid, process in list(self.workers.items()):
-            process.join(timeout=2)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=1)
-                if process.is_alive():
-                    process.kill()
+            process.join(timeout=0.5)
         
-        # # 4. IMPORTANT: Clear proxy object references
-        # self.worker_stats.clear()
-        # del self.worker_stats
-        # del self.stats_lock
-        
-        # 5. Join the queues AFTER workers are gone
-        self.worker_job_queue.cancel_join_thread()
-        self.result_queue.cancel_join_thread()
-        
-        logger.info(f"{self.name}: shutdown complete")
+            logger.info(f"{self.name}: shutdown complete")
 
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
@@ -373,82 +361,34 @@ class ResourceAwareScheduler:
         cpu_delta = self.cpu_worker_pool.scale_workers_to(target_cpu)
         return gpu_delta + cpu_delta, target_gpu + target_cpu 
 
-    # def stop(self):
-    #     """Stop the scheduler and clean up all resources"""
-    #     if not self.running:
-    #         return
-            
-    #     logger.info("Initiating scheduler shutdown")
-    #     self.running = False
-        
-    #     # 1. Wait for scheduler loop
-    #     if self.scheduler_thread and self.scheduler_thread.is_alive():
-    #         self.scheduler_thread.join(timeout=5)
-        
-    #     # 2. Drain job queue
-    #     while not self.job_queue.empty():
-    #         try:
-    #             self.job_queue.get_nowait()
-    #         except:
-    #             break
-        
-    #     # 3. Close and cleanup job queue FIRST
-    #     try:
-    #         self.job_queue.close()
-    #         self.job_queue.cancel_join_thread()
-    #     except:
-    #         pass
-        
-    #     # 4. NOW shutdown worker pools (they no longer need the job queue)
-    #     self.cpu_worker_pool.shutdown(timeout=10)
-    #     self.gpu_worker_pool.shutdown(timeout=10)
-        
-    #     logger.info("Scheduler shutdown complete")
-
     def stop(self):
         """Stop the scheduler and clean up all resources"""
-        logger.info("Initiating scheduler shutdown")
-        self.running = False
-        
-        # Wait for scheduler loop to exit FIRST
-        if self.scheduler_thread and self.scheduler_thread.is_alive():
-            logger.info("Waiting for scheduler thread to terminate")
-            self.scheduler_thread.join()
-            if self.scheduler_thread.is_alive():
-                logger.warning("Scheduler thread did not terminate within timeout")
-            else:
-                logger.info("Scheduler thread terminated successfully")
-        
-        logger.info("Scheduler thread joined, starting cleanup")
-        zombie_reaping()
-        logger.info("Zombie reaping complete")
-        if self.jobs_in_flight > 0:
-            logger.warning(f"Unexpected: {self.jobs_in_flight} jobs still in flight after drain")
-
-        # Close job queue
-        try:
-            logger.info("Closing job queue")
-            self.job_queue.close()
-            self.job_queue.cancel_join_thread()
-            logger.info("Job queue closed")
-        except Exception as e:
-            logger.error(f"Error closing job queue: {e}")
-
-        # Delegate worker pool shutdown
-        try:
-            logger.info(f"CPU worker pool state: workers={len(self.cpu_worker_pool.workers)}, stats={dict(self.cpu_worker_pool.worker_stats)}")
-            logger.info("Shutting down CPU worker pool")
-            self.cpu_worker_pool.shutdown(timeout=None)
-            logger.info("CPU worker pool shutdown complete")
+        if not self.running:
+            return
             
-            logger.info(f"GPU worker pool state: workers={len(self.gpu_worker_pool.workers)}, stats={dict(self.gpu_worker_pool.worker_stats)}")
-            logger.info("Shutting down GPU worker pool")
-            self.gpu_worker_pool.shutdown(timeout=None)
-            logger.info("GPU worker pool shutdown complete")
-        except Exception as e:
-            logger.error(f"Error shutting down worker pool: {e}")
-
-        logger.info("Scheduler shutdown complete")
+        logger.info("Initiating scheduler shutdown")
+        
+        try:
+            # Wait for scheduler thread
+            if self.scheduler_thread and self.scheduler_thread.is_alive():
+                self.scheduler_thread.join(timeout=5)
+            
+            # Drain job queue
+            while not self.job_queue.empty():
+                try:
+                    self.job_queue.get_nowait()
+                except:
+                    break
+            
+            # Shutdown worker pools
+            self.cpu_worker_pool.shutdown()
+            self.gpu_worker_pool.shutdown()
+            
+            logger.info("Scheduler shutdown complete")
+        
+        finally:
+            # Always mark as stopped
+            self.running = False
 
     def __enter__(self):
         return self
@@ -569,7 +509,7 @@ class ResourceAwareScheduler:
         try:
             while self.running:
                 # Schedule new jobs
-                zombie_reaping() # i.ex dataloader may spawn many threads
+                zombie_reaping()
                 in_flight, backlog, job_buffer = self.jobs_in_flight, self.backlog, self.job_buffer
                 n_jobs = self.target_concurrency + job_buffer - backlog - in_flight
                 logger.debug(f'Schedule more? target: {self.target_concurrency_split_by_resource}, buffer: {job_buffer}, jobs-in-worker-backlog: {backlog}, in-flight: {in_flight} -> ' + (f'adding {n_jobs}' if n_jobs > 0 else f'no action {n_jobs}'))
@@ -588,7 +528,7 @@ class ResourceAwareScheduler:
                     self._adjust_concurrency()
 
                 if self.completed_count >= self.total_queued_jobs:
-                    self.running = False
+                    break  # Exit loop, cleanup will happen in finally
                 else:
                     sleep(self.scheduler_loop_delay)
 
@@ -596,15 +536,14 @@ class ResourceAwareScheduler:
             logger.exception(f"Scheduler loop error: {e}")
         finally:
             logger.info("Scheduler loop exiting - draining remaining results")
-            # New: Drain all remaining results unconditionally
+            # Drain all remaining results
             while self.jobs_in_flight > 0:
                 for worker_pool in self.worker_pools.values():
-                    result = worker_pool.get_result(timeout=1.0)  # Longer timeout for drain
+                    result = worker_pool.get_result(timeout=1.0)
                     if result is not None:
                         self._handle_job_completion(result)
-                zombie_reaping()  # Keep cleaning up
-                sleep(0.1)  # Brief sleep to avoid tight loop
-            self.running = False
+                zombie_reaping()
+                sleep(0.1)
 
 def generic_parallel_grid_search(
     # Core parameters
@@ -708,29 +647,7 @@ def generic_parallel_grid_search(
         raise
     finally:
         logger.info("Shutting down shared manager")
-        # Debug: Check what's still alive
-        import multiprocessing
-        active = multiprocessing.active_children()
-        if active:
-            logger.info(f"Active processes before manager shutdown: {active}")
-            for p in active:
-                logger.info(f"  - {p.name} (pid={p.pid}, daemon={p.daemon})")
-        
-        # Try shutdown with timeout
         manager.shutdown()
-        
-        # Check if it actually shut down
-        if hasattr(manager, '_process'):
-            manager._process.join(timeout=2)
-            if manager._process.is_alive():
-                logger.warning("Manager process still alive after shutdown!")
-                manager._process.terminate()
-                manager._process.join(timeout=1)
-                if manager._process.is_alive():
-                    logger.error("Manager process won't die!")
-                    manager._process.kill()
-        
-        logger.info("Manager cleanup complete")
 
     return history, best_params
                     
