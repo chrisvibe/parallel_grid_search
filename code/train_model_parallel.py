@@ -289,8 +289,8 @@ class ResourceAwareScheduler:
         self.scheduler_loop_delay = scheduler_loop_delay
         
         # Worker pool
-        self.cpu_worker_pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=5, name='cpu')
-        self.gpu_worker_pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=10, name='gpu')
+        self.cpu_worker_pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=5, name='cpu_pool')
+        self.gpu_worker_pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=10, name='gpu_pool')
         self.worker_pools = {'cpu': self.cpu_worker_pool, 'gpu': self.gpu_worker_pool}
         
         # Job tracking
