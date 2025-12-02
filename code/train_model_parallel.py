@@ -9,7 +9,7 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 import threading
 from typing import Tuple, Callable, List, Dict, Any
-from projects.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
+from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
 import errno
 from os import waitpid, WNOHANG
 
