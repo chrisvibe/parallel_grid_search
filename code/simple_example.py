@@ -320,7 +320,7 @@ def simple_parallel_grid_search(
     logger.info("Starting parallel grid search...")
     history, best_params = generic_parallel_grid_search(
         job_factory=factory,
-        total_configs=len(param_combinations),
+        total_jobs=len(param_combinations),
         samples_per_config=samples_per_config,
         output_path=output_path,
         gpu_memory_per_job_gb=gpu_memory_per_job_gb,

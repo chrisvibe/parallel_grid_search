@@ -230,6 +230,7 @@ class LazyWorkerPool:
             removed += 1
         logger.info(f"{self.name}: Scaled down {removed} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
         return -removed
+
     
     def submit_job(self, job, device):
         """Submit a job with pre-allocated device"""
@@ -285,6 +286,7 @@ class ResourceAwareScheduler:
         # Control
         self.resource_manager = resource_manager
         self.running = False
+        self.submission_complete = False
         self.scheduler_thread = None
         self.scheduler_loop_delay = scheduler_loop_delay
         
@@ -336,9 +338,11 @@ class ResourceAwareScheduler:
     def average_completion_time(self):
         return sum(self.job_completion_times) / len(self.job_completion_times) if self.job_completion_times else self.scheduler_loop_delay
         
-    def start(self):
-        """Start scheduler"""
+    def start(self, job_generator):
+        """Start scheduler + job submission"""
         self.running = True
+        self._start_job_submission(job_generator)
+
         
         logger.debug(f"Added initial jobs and workers {self.target_concurrency_split_by_resource}, total: {self.target_concurrency}")
         self._schedule_jobs(n_jobs=self.target_concurrency)
@@ -365,31 +369,30 @@ class ResourceAwareScheduler:
         """Stop the scheduler and clean up all resources"""
         if not self.running:
             return
+        self.running = False
             
         logger.info("Initiating scheduler shutdown")
         
-        try:
-            # Wait for scheduler thread
-            if self.scheduler_thread and self.scheduler_thread.is_alive():
-                self.scheduler_thread.join(timeout=5)
-            
-            # Drain job queue
-            while not self.job_queue.empty():
-                try:
-                    self.job_queue.get_nowait()
-                except:
-                    break
-            
-            # Shutdown worker pools
-            self.cpu_worker_pool.shutdown()
-            self.gpu_worker_pool.shutdown()
-            
-            logger.info("Scheduler shutdown complete")
+        # Wait for scheduler thread
+        if self.scheduler_thread and self.scheduler_thread.is_alive():
+            self.scheduler_thread.join(timeout=5)
         
-        finally:
-            # Always mark as stopped
-            self.running = False
-
+        if hasattr(self, 'submit_thread') and self.submit_thread.is_alive():
+            self.submit_thread.join(timeout=5)
+        
+        # Drain job queue
+        while not self.job_queue.empty():
+            try:
+                self.job_queue.get_nowait()
+            except:
+                break
+        
+        # Shutdown worker pools
+        self.cpu_worker_pool.shutdown()
+        self.gpu_worker_pool.shutdown()
+        
+        logger.info("Scheduler shutdown complete")
+        
     def __enter__(self):
         return self
     
@@ -399,10 +402,25 @@ class ResourceAwareScheduler:
        self.stop()
        return False
 
-    def add_job(self, job):
-        """Add job to queue"""
+    def _add_job(self, job, max_queue_size=1000):
+        while self.job_queue.qsize() >= max_queue_size:
+            if not self.running:
+                return False
+            sleep(5)
         self.job_queue.put(job)
         self.total_queued_jobs += 1
+        return True
+
+    def _start_job_submission(self, job_generator):
+        """Start background job submission thread"""
+        def submit_jobs():
+            for job in job_generator:
+                if not self._add_job(job):
+                    break
+            self.submission_complete = True
+        self.submit_thread = threading.Thread(target=submit_jobs, daemon=True)
+        logger.info(f"Submitting {len(job_generator)} jobs to scheduler")
+        self.submit_thread.start()
 
     def _calculate_spawn_delay(self):
         # Fast submission when under capacity
@@ -521,7 +539,7 @@ class ResourceAwareScheduler:
                 if (self.completed_count - self.last_completed_count >= self.scaling_threshold) and self.running:
                     self._adjust_concurrency()
 
-                if self.completed_count >= self.total_queued_jobs:
+                if self.submission_complete and self.completed_count >= self.total_queued_jobs:
                     break  # Exit loop, cleanup will happen in finally
                 else:
                     sleep(self.scheduler_loop_delay)
@@ -542,7 +560,7 @@ class ResourceAwareScheduler:
 def generic_parallel_grid_search(
     # Core parameters
     job_factory: Callable,
-    total_configs: int,
+    total_jobs: int,
     samples_per_config: int,
     output_path: Path,
     save_config: Callable[[Path], None],
@@ -592,17 +610,11 @@ def generic_parallel_grid_search(
     try:
         job_generator = GenericJobGenerator(manager=manager,
                                  job_factory=job_factory,
-                                 total_configs=total_configs,
+                                 total_jobs=total_jobs,
                                  samples_per_config=samples_per_config,
                                  )
         with ResourceAwareScheduler(resource_manager=resource_manager, manager=manager) as scheduler:
-            total_jobs = len(job_generator)
-            logger.info(f"Submitting {total_jobs} jobs to scheduler")
-            
-            for job in job_generator:
-                scheduler.add_job(job)
-            
-            scheduler.start()
+            scheduler.start(job_generator)
             
             # Wait for completion
             start_time = time()

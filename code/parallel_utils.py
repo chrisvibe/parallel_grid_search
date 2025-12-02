@@ -54,12 +54,12 @@ class JobInterface(ABC):
 class GenericJobGenerator:
     """Generic job generator that can create any type of job"""
     
-    def __init__(self, manager, job_factory, total_configs: int, samples_per_config: int):
+    def __init__(self, manager, job_factory, total_jobs: int, samples_per_config: int):
         """
         job_factory: A callable that takes (i, j, total_configs, total_samples, shared, locks) and returns a job
         """
         self.job_factory = job_factory
-        self.total_configs = total_configs
+        self.total_configs = total_jobs
         self.samples_per_config = samples_per_config
 
         self.mp_manager = manager 
