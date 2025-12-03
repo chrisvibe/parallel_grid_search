@@ -35,9 +35,6 @@ class JobInterface(ABC):
             return self._run(device)
         except torch.cuda.OutOfMemoryError as e:
             logger.error(f"GPU OOM for job {self.i}-{self.j}")
-            if 'cuda' in str(device):
-                with torch.cuda.device(device):
-                    torch.cuda.empty_cache()
             return {'status': 'error', 'error_type': 'OOM', 'error': str(e)}
         except Exception as e:
             logger.exception(f"Error in job {self.i}-{self.j}: {e}")
@@ -49,6 +46,9 @@ class JobInterface(ABC):
         config_str = f"{self.i+1:0{self._config_pad}d}/{self.total_configs}"
         sample_str = f"{self.j+1:0{self._sample_pad}d}/{self.total_samples}"
         return f"Config: {config_str}, Sample: {sample_str}"
+    
+    def __str__(self):
+        return f'{self.i}-{self.j}'
 
 
 class GenericJobGenerator:
@@ -344,7 +344,6 @@ class GPUJobResourceManager:
         # Simple counters (no multiprocessing)
         self.gpu_allocated_jobs = {}
         self.gpu_target_concurrent = {}
-        self.gpu_reset_pending = {}
         self.last_allocated_gpu = -1
         
         # Unified metrics tracking
@@ -413,7 +412,6 @@ class GPUJobResourceManager:
                 
                 self.gpu_allocated_jobs[gpu_id] = 0
                 self.gpu_target_concurrent[gpu_id] = self.initial_concurrency
-                self.gpu_reset_pending[gpu_id] = False
                 
             except Exception as e:
                 logger.warning(f"Failed to initialize GPU {gpu_id}: {e}")
@@ -510,16 +508,9 @@ class GPUJobResourceManager:
         else:
             perf['ewma'] = self.ewma_alpha * utilization + (1 - self.ewma_alpha) * perf['ewma']
 
-    def _mark_for_reset(self, gpu_id, memory_utilization):
-        """Mark GPU for reset when memory usage is too high"""
-        if not self.gpu_reset_pending[gpu_id]:
-            self.gpu_reset_pending[gpu_id] = True
-            logger.warning(f"GPU {gpu_id} memory at {memory_utilization:.1%} - "
-                              f"marked for reset after current jobs complete")
-
     def can_allocate_job_on_this_gpu(self, gpu_id):
         """Check if we can allocate a job to this GPU"""
-        if gpu_id not in self.available_gpus or self.gpu_reset_pending[gpu_id]:
+        if gpu_id not in self.available_gpus:
             return False
         
         try:
@@ -609,9 +600,6 @@ class GPUJobResourceManager:
             index = (start_index + 1 + i) % gpu_count
             gpu_id = self.available_gpus[index]
 
-            if self.gpu_reset_pending[gpu_id]:
-                continue
-
             current_jobs = self.gpu_allocated_jobs[gpu_id]
             max_jobs = self.gpu_target_concurrent[gpu_id]
 
@@ -630,49 +618,28 @@ class GPUJobResourceManager:
         if gpu_id in self.gpu_allocated_jobs:
             self.gpu_allocated_jobs[gpu_id] -= 1 
             
-            # Perform reset if pending and no jobs remain
-            if self.gpu_reset_pending[gpu_id] and self.gpu_allocated_jobs[gpu_id] == 0:
-                self._perform_reset(gpu_id)
-
-    def _perform_reset(self, gpu_id):
-        """Clear GPU memory and reset state"""
-        try:
-            logger.debug(f"Resetting GPU {gpu_id}")
-            
-            # Clear GPU memory
-            with torch.cuda.device(gpu_id):
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            
-            # Clear metrics history
-            metrics = self.gpu_metrics[gpu_id]
-            metrics['memory_util']['history'].clear()
-            metrics['memory_util']['ewma'] = 0.0
-            metrics['compute_util']['history'].clear()
-            metrics['compute_util']['ewma'] = 0.0
-            
-            # Reset flags
-            self.gpu_reset_pending[gpu_id] = False
-            
-            logger.debug(f"GPU {gpu_id} reset complete")
-            
-        except Exception as e:
-            logger.error(f"Resetting GPU {gpu_id}: {e}")
-            self.gpu_reset_pending[gpu_id] = False
-
     def handle_oom(self, gpu_id):
         """Handle out-of-memory error"""
         logger.warning(f"OOM on GPU {gpu_id}")
+        
+        # Reset allocation tracking
         if gpu_id in self.gpu_allocated_jobs:
-            # Trigger reset
-            self._mark_for_reset(gpu_id, 1.0)
-            
-            # Immediate cache clear
-            try:
-                with torch.cuda.device(gpu_id):
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            self.gpu_allocated_jobs[gpu_id] = 0
+        
+        # Clear metrics (stale after OOM)
+        metrics = self.gpu_metrics[gpu_id]
+        metrics['memory_util']['history'].clear()
+        metrics['memory_util']['ewma'] = 0.0
+        metrics['compute_util']['history'].clear()
+        metrics['compute_util']['ewma'] = 0.0
+        
+        # Cache clear
+        try:
+            with torch.cuda.device(gpu_id):
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception as e:
+            logger.error(f"Failed to clear cache on GPU {gpu_id}: {e}")
 
     def get_status(self):
         """Get current status of all GPUs"""
@@ -695,9 +662,6 @@ class GPUJobResourceManager:
                            f"{mem_free_gb:.1f}GB free, {mem_util_pct:.0f}% mem used " \
                            f"(avg: {avg_mem:.0f}% mem, {avg_compute:.0f}% compute)"
                 
-                if self.gpu_reset_pending[gpu_id]:
-                    status_str += " [RESET PENDING]"
-                    
                 status.append(status_str)
                 
             except Exception:
@@ -708,10 +672,6 @@ class GPUJobResourceManager:
     def get_total_capacity(self):
         """Get total job capacity across all GPUs"""
         return sum(self.gpu_target_concurrent[gpu_id] for gpu_id in self.available_gpus)
-
-    def has_pending_resets(self):
-        """Check if any GPUs have pending resets"""
-        return any(self.gpu_reset_pending[gpu_id] for gpu_id in self.available_gpus)
 
     def adjust_target_concurrency(self):
         for gpu_id in self.available_gpus:

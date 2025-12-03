@@ -72,6 +72,7 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 
                 job_completed_successfully = True
                 result_queue.put(result)
+
                 logger.debug(f"Worker completed job {job.i}-{job.j} on {device}")
                 
             except Exception as e:
@@ -137,6 +138,8 @@ class LazyWorkerPool:
         self.worker_job_queue = mp.Queue()
         self.result_queue = mp.Queue()
         self.spawn_delay = spawn_rate 
+        self.accepting_jobs = True
+        self.in_flight = dict() 
         
         self.mp_manager = manager 
         self.worker_stats = self.mp_manager.dict({
@@ -230,7 +233,12 @@ class LazyWorkerPool:
         return -removed
 
     def submit_job(self, job):
-        self.worker_job_queue.put({'job': job})
+        if self.accepting_jobs:
+            self.in_flight[str(job)] = job
+            self.worker_job_queue.put({'job': job})
+            return True
+        else:
+            return False
     
     def get_result(self, timeout=None):
         """Get a result from the result queue"""
@@ -249,25 +257,45 @@ class LazyWorkerPool:
     def shutdown(self, timeout=30):
         """Shutdown all workers and clean up resources"""
         logger.info(f"{self.name}: Initiating shutdown")
+        self.disable(reque=False)
         
-        # Send shutdown signals
-        for _ in range(len(self.workers)):
-            try:
-                self.worker_job_queue.put(None, timeout=0.1)
-            except:
-                pass
-        
-        # Close queues
         self.worker_job_queue.close()
         self.result_queue.close()
         
-        # Wait briefly for daemon workers (they'll die with main process anyway)
-        logger.debug(f"{self.name}: shutdown workers")
-        for pid, process in list(self.workers.items()):
-            process.join(timeout=0.5)
-            logger.debug(f"{self.name}:{pid} killed")
+        logger.info(f"{self.name}: shutdown complete") 
+
+    def kill_all_workers(self):
+        """Immediately terminate all workers"""
+        for pid, proc in list(self.workers.items()):
+            proc.terminate()  # SIGTERM
         
-        logger.info(f"{self.name}: shutdown complete")
+        # Brief wait, then force kill
+        sleep(0.5)
+        for pid, proc in list(self.workers.items()):
+            if proc.is_alive():
+                proc.kill()  # SIGKILL
+            proc.join(timeout=1)
+        
+        self.workers.clear()
+        
+        # Reset worker stats
+        with self.stats_lock:
+            self.worker_stats['idle'] = 0
+            self.worker_stats['busy'] = 0
+    
+    def mark_completed(self, job):
+        self.in_flight.pop(str(job), None)
+
+    def enable(self):
+        self.accepting_jobs = True
+
+    def disable(self, reque=True):
+        self.accepting_jobs = False
+        self.kill_all_workers()
+        if reque:
+            for job in self.in_flight.values(): # Requeue in-flight jobs (put back in own queue)
+                self.worker_job_queue.put({'job': job})
+        self.in_flight.clear()
 
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
@@ -436,6 +464,7 @@ class ResourceAwareScheduler:
         """Handle job completion - release resources (if a job was launched resources were reserved)"""
         job = result['job']
         device = result['device']
+        self.worker_pools[device].mark_completed(job) 
         
         if result['status'] == 'completed':
             # Track completion time
@@ -449,13 +478,20 @@ class ResourceAwareScheduler:
         elif result['status'] == 'error':
             if result.get('error_type') == 'OOM':
                 logger.error(f"OOM job {job.i}-{job.j} on device {device}")
-                self.resource_manager.handle_oom(device)
+                self._handle_oom(device)
             else:
                 logger.error(f"Unknown error on job {job.i}-{job.j} on device {device}")
             logger.warning(f"Putting {job.i}-{job.j} back in job_queue")
 
         self.resource_manager.release_resources(device)
 
+    def _handle_oom(self, device):
+        pool = self.worker_pools[device]
+        pool.disable()
+        self.resource_manager.handle_oom(pool.device)
+        pool.enable()
+        logger.info(f"{pool.name} - {pool.device} recovered from OOM")
+    
     def _schedule_jobs(self, n_jobs=1):
         if not self.running:
             return
@@ -477,14 +513,11 @@ class ResourceAwareScheduler:
         if device is None:
             return False
         
-        pool = self.worker_pools[device] 
-        try:
-            pool.submit_job(job)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to submit job: {e}")
+        pool = self.worker_pools[device]
+        if not pool.submit_job(job):
             self.resource_manager.release_resources(device)
             return False
+        return True
 
     def _adjust_concurrency(self):
         """Adjust concurrency based on completion rate and system resources"""

@@ -79,6 +79,7 @@ class SimpleParams:
     n_features: int = 10
     noise: float = 0.1
     seed: int = 42
+    test_oom_on_job = '5-1'
 
 
 class SimpleLinearJob(JobInterface):
@@ -92,6 +93,9 @@ class SimpleLinearJob(JobInterface):
     def _run(self, device):
         """Run training job on specified device"""
         logger.info(f"{self.get_log_prefix()} Starting on {device}")
+
+        if str(self) == self.params.test_oom_on_job:
+            raise torch.cuda.OutOfMemoryError("Fake OOM for testing")
         
         # Set seed for reproducibility
         torch.manual_seed(self.params.seed)
