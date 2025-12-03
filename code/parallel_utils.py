@@ -343,7 +343,7 @@ class GPUJobResourceManager:
         
         # Simple counters (no multiprocessing)
         self.gpu_allocated_jobs = {}
-        self.gpu_max_concurrent = {}
+        self.gpu_target_concurrent = {}
         self.gpu_reset_pending = {}
         self.last_allocated_gpu = -1
         
@@ -412,7 +412,7 @@ class GPUJobResourceManager:
                                f"Total Memory: {mem_info.total/(1024**3):.2f}GB")
                 
                 self.gpu_allocated_jobs[gpu_id] = 0
-                self.gpu_max_concurrent[gpu_id] = self.initial_concurrency
+                self.gpu_target_concurrent[gpu_id] = self.initial_concurrency
                 self.gpu_reset_pending[gpu_id] = False
                 
             except Exception as e:
@@ -493,7 +493,7 @@ class GPUJobResourceManager:
             avg_compute_util = self._update_metric(gpu_id, 'compute_util', compute_utilization, force_update=True)
             
             # Update concurrency performance tracking
-            concurrency_level = self.gpu_max_concurrent[gpu_id]
+            concurrency_level = self.gpu_target_concurrent[gpu_id]
             self._update_concurrency_performance(gpu_id, concurrency_level, compute_utilization)
             
             return compute_utilization, avg_compute_util
@@ -541,7 +541,7 @@ class GPUJobResourceManager:
         if gpu_id not in self.available_gpus or self.has_pending_resets():
             return False
         
-        if self.gpu_allocated_jobs[gpu_id] < self.gpu_max_concurrent[gpu_id]:
+        if self.gpu_allocated_jobs[gpu_id] < self.gpu_target_concurrent[gpu_id]:
             return False
 
         # Check memory availability
@@ -571,10 +571,10 @@ class GPUJobResourceManager:
         if len(perf_data) < 2:
             return False
             
-        current_level = self.gpu_max_concurrent[gpu_id]
+        current_level = self.gpu_target_concurrent[gpu_id]
         
-        # Find best performing concurrency level
-        best_level = max(perf_data.keys(), key=lambda l: perf_data[l]['ewma'])
+        # Find best performing concurrency level (prefer lower concurrency)
+        best_level = max(perf_data.keys(), key=lambda l: (perf_data[l]['ewma'], -l))
         
         # Decrease if current level performs worse than best level
         return current_level > best_level and current_level > 1
@@ -613,7 +613,7 @@ class GPUJobResourceManager:
                 continue
 
             current_jobs = self.gpu_allocated_jobs[gpu_id]
-            max_jobs = self.gpu_max_concurrent[gpu_id]
+            max_jobs = self.gpu_target_concurrent[gpu_id]
 
             if current_jobs < max_jobs and self.can_allocate_job_on_this_gpu(gpu_id):
                 if allocate:
@@ -685,7 +685,7 @@ class GPUJobResourceManager:
                 mem_util_pct = (mem_info.used / mem_info.total) * 100
                 
                 jobs = self.gpu_allocated_jobs[gpu_id]
-                max_jobs = self.gpu_max_concurrent[gpu_id]
+                max_jobs = self.gpu_target_concurrent[gpu_id]
                 
                 # Get average metrics
                 avg_mem = self._get_metric_average(gpu_id, 'memory_util') * 100
@@ -707,7 +707,7 @@ class GPUJobResourceManager:
 
     def get_total_capacity(self):
         """Get total job capacity across all GPUs"""
-        return sum(self.gpu_max_concurrent[gpu_id] for gpu_id in self.available_gpus)
+        return sum(self.gpu_target_concurrent[gpu_id] for gpu_id in self.available_gpus)
 
     def has_pending_resets(self):
         """Check if any GPUs have pending resets"""
@@ -716,7 +716,7 @@ class GPUJobResourceManager:
     def adjust_target_concurrency(self):
         for gpu_id in self.available_gpus:
             self._adjust_target_concurrency(gpu_id)
-        return self.gpu_max_concurrent
+        return self.gpu_target_concurrent
 
     def _adjust_target_concurrency(self, gpu_id):
         """Adjust concurrency based on performance metrics"""
@@ -724,13 +724,13 @@ class GPUJobResourceManager:
             return False
             
         if self.should_increase_concurrency(gpu_id):
-            self.gpu_max_concurrent[gpu_id] += 1
-            logger.debug(f"Increased GPU {gpu_id} concurrency limit to {self.gpu_max_concurrent[gpu_id]}")
+            self.gpu_target_concurrent[gpu_id] += 1
+            logger.debug(f"Increased GPU {gpu_id} concurrency limit to {self.gpu_target_concurrent[gpu_id]}")
             logger.debug(self.get_status())
             return True
         elif self.should_decrease_concurrency(gpu_id):
-            self.gpu_max_concurrent[gpu_id] = max(1, self.gpu_max_concurrent[gpu_id] - 1)
-            logger.debug(f"Decreased GPU {gpu_id} concurrency limit to {self.gpu_max_concurrent[gpu_id]}")
+            self.gpu_target_concurrent[gpu_id] = max(1, self.gpu_target_concurrent[gpu_id] - 1)
+            logger.debug(f"Decreased GPU {gpu_id} concurrency limit to {self.gpu_target_concurrent[gpu_id]}")
             logger.debug(self.get_status())
             return True
             
@@ -821,7 +821,12 @@ class ComputeJobResourceManager:
 
     @property
     def target_concurrency_split_by_resource(self):
-        return {'cpu': self.cpu_manager.target_concurrency, 'gpu': self.gpu_target_concurrency}
+        targets = {torch.device('cpu'): self.cpu_manager.target_concurrency}
+        if self.use_gpu:
+            for gpu_id in self.gpu_manager.available_gpus:
+                dev = torch.device(f'cuda:{gpu_id}')
+                targets[dev] = self.gpu_manager.gpu_target_concurrent[gpu_id]
+        return targets
 
     @property
     def gpu_target_concurrency(self):
@@ -833,11 +838,9 @@ class ComputeJobResourceManager:
     @property
     def cores_per_job(self):
         return self.cpu_manager.cores_per_job
-    
+
     def adjust_target_concurrency(self):
-        target_concurrency_cpu_and_gpu = self.cpu_manager.adjust_target_concurrency()
+        self.cpu_manager.adjust_target_concurrency()
         if self.use_gpu:
-            target_concurrency_per_gpu = self.gpu_manager.adjust_target_concurrency()
-            self.target_concurrency_split_by_resource['gpu'] = min(sum(target_concurrency_per_gpu.values()), target_concurrency_cpu_and_gpu)
-        self.target_concurrency_split_by_resource['cpu'] = target_concurrency_cpu_and_gpu - self.target_concurrency_split_by_resource['gpu'] 
-        return self.target_concurrency_split_by_resource
+            self.gpu_manager.adjust_target_concurrency()
+        return self.target_concurrency_split_by_resource 

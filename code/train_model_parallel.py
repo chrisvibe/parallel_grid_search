@@ -12,6 +12,7 @@ from typing import Tuple, Callable, List, Dict, Any
 from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
 import errno
 from os import waitpid, WNOHANG
+import torch
 
 if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method('spawn')
@@ -20,11 +21,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def worker_function(job_queue, result_queue, cores_per_job, priority, worker_stats, stats_lock):
+def worker_function(job_queue, result_queue, cores_per_job, priority, worker_stats, stats_lock, device):
     """Worker with proper stat tracking"""
     set_num_interop_threads(1)
     set_num_threads(cores_per_job)
     p = psutil.Process()
+
+    if device.type == 'cuda':
+        torch.cuda.set_device(device.index)
     
     # Set process priority
     try:
@@ -50,8 +54,6 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
             job_completed_successfully = False
             try:
                 job = job_data['job']
-                resources = job_data['resources']
-                device = resources['device']
                 
                 # Run job
                 start_time = time()
@@ -127,15 +129,11 @@ def zombie_reaping():
 class LazyWorkerPool:
     """Simplified worker pool that creates workers on demand"""
 
-    def __init__(self, manager, max_workers: int, cores_per_job: int, process_priority=5, name=None, spawn_rate=1):
-        # Don't force set_start_method here - it should be set once globally
-        # mp.set_start_method('spawn', force=True)  # REMOVE THIS
-        
+    def __init__(self, manager, max_workers, cores_per_job, process_priority=5, spawn_rate=1, device='cpu'):
+        self.device = torch.device(device)
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
         self.process_priority = process_priority
-        # self.worker_job_queue = Queue()
-        # self.result_queue = Queue()
         self.worker_job_queue = mp.Queue()
         self.result_queue = mp.Queue()
         self.spawn_delay = spawn_rate 
@@ -150,7 +148,7 @@ class LazyWorkerPool:
         self.stats_lock = self.mp_manager.Lock()
         self.workers = dict()
         
-        self.name = self.__class__.__name__ if name is None else name
+        self.name = device + '_pool'
         logger.info(f"{self.name} initialized with max_workers={max_workers}")
     
     def safe_get_stat(self, key):
@@ -206,7 +204,7 @@ class LazyWorkerPool:
                 p = Process(
                     target=worker_function,
                     args=(self.worker_job_queue, self.result_queue, self.cores_per_job, 
-                        self.process_priority, self.worker_stats, self.stats_lock),
+                        self.process_priority, self.worker_stats, self.stats_lock, self.device),
                     daemon=True,
                 )
                 p.start()
@@ -231,17 +229,9 @@ class LazyWorkerPool:
         logger.info(f"{self.name}: Scaled down {removed} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
         return -removed
 
+    def submit_job(self, job):
+        self.worker_job_queue.put({'job': job})
     
-    def submit_job(self, job, device):
-        """Submit a job with pre-allocated device"""
-        job_data = {
-            'job': job,
-            'resources': {
-                'device': device, 
-            },
-        }
-        self.worker_job_queue.put(job_data)
-   
     def get_result(self, timeout=None):
         """Get a result from the result queue"""
         try:
@@ -281,7 +271,8 @@ class LazyWorkerPool:
 
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
-    
+
+
     def __init__(self, resource_manager: ComputeJobResourceManager, manager, scheduler_loop_delay:int=1):
         # Control
         self.resource_manager = resource_manager
@@ -291,9 +282,13 @@ class ResourceAwareScheduler:
         self.scheduler_loop_delay = scheduler_loop_delay
         
         # Worker pool
-        self.cpu_worker_pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=5, name='cpu_pool')
-        self.gpu_worker_pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=10, name='gpu_pool')
-        self.worker_pools = {'cpu': self.cpu_worker_pool, 'gpu': self.gpu_worker_pool}
+        self.worker_pools = dict()
+        pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=5)
+        self.worker_pools[pool.device] = pool
+        if self.resource_manager.use_gpu:
+            for gpu_id in self.resource_manager.gpu_manager.available_gpus:
+                pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=10, device=f'cuda:{gpu_id}')
+                self.worker_pools[pool.device] = pool
         
         # Job tracking
         self.job_queue = mp.Queue()
@@ -320,19 +315,19 @@ class ResourceAwareScheduler:
 
     @property
     def jobs_in_flight(self):
-        return self.cpu_worker_pool.busy_workers + self.gpu_worker_pool.busy_workers
+        return sum(pool.busy_workers for pool in self.worker_pools.values()) 
 
     @property
     def backlog(self):
-        return self.cpu_worker_pool.backlog + self.gpu_worker_pool.backlog
+        return sum(pool.backlog for pool in self.worker_pools.values()) 
 
     @property
     def completed_count(self):
-        return self.cpu_worker_pool.jobs_completed + self.gpu_worker_pool.jobs_completed
+        return sum(pool.jobs_completed for pool in self.worker_pools.values())
 
     @property
     def max_workers(self):
-        return self.cpu_worker_pool.max_workers + self.gpu_worker_pool.max_workers
+        return sum(pool.max_workers for pool in self.worker_pools.values())
 
     @property
     def average_completion_time(self):
@@ -356,14 +351,13 @@ class ResourceAwareScheduler:
     
     def scale_workers(self):
         target_concurrency = self.target_concurrency_split_by_resource
-        target_gpu = target_concurrency['gpu']
-        target_cpu = target_concurrency['cpu']
         delay = self._calculate_spawn_delay() # Thundering herd prevention
-        self.gpu_worker_pool.spawn_delay = delay
-        self.cpu_worker_pool.spawn_delay = delay
-        gpu_delta = self.gpu_worker_pool.scale_workers_to(target_gpu)
-        cpu_delta = self.cpu_worker_pool.scale_workers_to(target_cpu)
-        return gpu_delta + cpu_delta, target_gpu + target_cpu 
+        delta = 0
+        for device, pool in self.worker_pools.items():
+            pool.spawn_delay = delay
+            target = target_concurrency[device]
+            delta += pool.scale_workers_to(target)
+        return delta, sum(target_concurrency.values())
 
     def stop(self):
         """Stop the scheduler and clean up all resources"""
@@ -388,8 +382,8 @@ class ResourceAwareScheduler:
                 break
         
         # Shutdown worker pools
-        self.cpu_worker_pool.shutdown()
-        self.gpu_worker_pool.shutdown()
+        for device, pool in self.worker_pools.items():
+            pool.shutdown()
         
         logger.info("Scheduler shutdown complete")
         
@@ -483,9 +477,9 @@ class ResourceAwareScheduler:
         if device is None:
             return False
         
-        pool = self.gpu_worker_pool if device.type == 'cuda' else self.cpu_worker_pool
+        pool = self.worker_pools[device] 
         try:
-            pool.submit_job(job, device)
+            pool.submit_job(job)
             return True
         except Exception as e:
             logger.error(f"Failed to submit job: {e}")
@@ -528,9 +522,9 @@ class ResourceAwareScheduler:
                 if n_jobs > 0 and self.running:
                     self._schedule_jobs(n_jobs=n_jobs)
 
-                for worker_pool in self.worker_pools.values():
+                for pool in self.worker_pools.values():
                     while True:
-                        result = worker_pool.get_result(timeout=0.1)
+                        result = pool.get_result(timeout=0.1)
                         if result is None:
                             break
                         self._handle_job_completion(result)
@@ -550,8 +544,8 @@ class ResourceAwareScheduler:
             logger.info("Scheduler loop exiting - draining remaining results")
             # Drain all remaining results
             while self.jobs_in_flight > 0:
-                for worker_pool in self.worker_pools.values():
-                    result = worker_pool.get_result(timeout=1.0)
+                for pool in self.worker_pools.values():
+                    result = pool.get_result(timeout=1.0)
                     if result is not None:
                         self._handle_job_completion(result)
                 zombie_reaping()
