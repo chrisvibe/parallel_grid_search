@@ -363,6 +363,6 @@ if __name__ == "__main__":
         output_path=SimpleParams.out_path,
         samples_per_config=2,  # Reduced for demo
         gpu_memory_per_job_gb=0.5,
-        cpu_memory_per_job_gb=1.0,
+        cpu_memory_per_job_gb=0.5,
         cpu_cores_per_job=1
     )

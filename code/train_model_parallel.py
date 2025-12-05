@@ -14,6 +14,8 @@ from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator
 import errno
 from os import waitpid, WNOHANG
 import torch
+import traceback
+import sys
 
 if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method('spawn')
@@ -62,7 +64,8 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                     time.sleep(0.2)
             except queue.Empty:
                 # No job available
-                continue
+                break
+                # continue # TODO decide
            
             # Transition from idle -> busy
             with stats_lock:
@@ -120,8 +123,10 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                     except Exception as e:
                         logger.error(f"Job cleanup error: {e}")
     
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: # TODO do we need??
         logger.info("Worker received KeyboardInterrupt")
+        print("KeyboardInterrupt caught! Current stack:")
+        traceback.print_stack(file=sys.stdout)
     except ValueError as e:
         if "is closed" not in str(e):
             logger.exception(f"Worker error: {e}")
@@ -594,7 +599,9 @@ class ResourceAwareScheduler:
                         self._handle_job_completion(result)
                     
                         # Recovery check
+                        print('\n', 'here', pool.total_workers, pool.backlog)
                         if pool.total_workers == 0 and pool.backlog > 0:
+                            print('recovering...')
                             pool.scale_workers_to(1)
 
                 # Adjust concurrency based on completion rate
@@ -680,7 +687,7 @@ def generic_parallel_grid_search(
             start_time = time()
             with logging_redirect_tqdm():
                 total_jobs = len(job_generator)
-                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="jobs") as pbar:
+                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="jobs") as pbar: # TODO per config or job?
                     while pbar.n < total_jobs:
                         pbar.n = scheduler.completed_count
                         pbar.refresh()
