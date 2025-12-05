@@ -12,6 +12,7 @@ import time
 import logging
 import pandas as pd
 from copy import deepcopy
+from shutil import rmtree
 
 # Import the grid search framework
 from train_model_parallel import generic_parallel_grid_search
@@ -155,7 +156,7 @@ class SimpleLinearJob(JobInterface):
                 self.shared['best_params']['loss'] = final_loss
                 self.shared['best_params']['params'] = self.params
         
-        return {'status': 'success', 'stats': results}
+        return {'status': 'completed', 'stats': results}
     
     def _train_model(self, model, dataset):
         """Train the model and return metrics"""
@@ -347,6 +348,15 @@ if __name__ == "__main__":
         print(f"CUDA devices: {torch.cuda.device_count()}")
         for i in range(torch.cuda.device_count()):
             print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+
+    # resp = input(f"Are you sure you want to delete '{SimpleParams.out_path}'? (y/N): ").strip().lower()
+    resp = 'y' # TODO remove
+    if resp == 'y':
+        rmtree(SimpleParams.out_path)
+        print("Directory deleted.")
+    else:
+        print("Canceled.")
+        rmtree(SimpleParams.out_path)
     
     # Run grid search
     history, best_params = simple_parallel_grid_search(

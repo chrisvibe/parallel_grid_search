@@ -43,10 +43,27 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
     
     try:
         while True:
-            job_data = job_queue.get()
-            if job_data is None:  # Shutdown signal
-                break
-            
+            try:
+                enabled = False
+                with stats_lock:
+                    enabled = worker_stats['enabled']
+
+                if enabled:
+                    print("get job...")
+                    job_data = job_queue.get(timeout=1.0)
+
+                    if job_data is None:
+                        print("breaking...")
+                        break
+
+                    print("work...")
+                else:
+                    print("cant work...")
+                    time.sleep(0.2)
+            except queue.Empty:
+                # No job available
+                continue
+           
             # Transition from idle -> busy
             with stats_lock:
                 worker_stats['idle'] -= 1
@@ -63,15 +80,13 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 
                 # Add metadata
                 result.update({
-                    'status': 'completed', 
                     'job': job,
                     'device': device,
                     'worker_pid': p.pid,
                     'start_time': start_time,
                     'stop_time': time(),
                 })
-                
-                job_completed_successfully = True
+                job_completed_successfully = (result.get('status') != 'error')
                 result_queue.put(result)
 
                 logger.debug(f"Worker completed job {job.i}-{job.j} on {device}")
@@ -139,7 +154,6 @@ class LazyWorkerPool:
         self.worker_job_queue = mp.Queue()
         self.result_queue = mp.Queue()
         self.spawn_delay = spawn_rate 
-        self.accepting_jobs = True
         self.in_flight = dict() 
         
         self.mp_manager = manager 
@@ -148,6 +162,7 @@ class LazyWorkerPool:
             'busy': 0,
             'jobs_completed': 0,
             'jobs_failed': 0,
+            'enabled': True,
         })
         self.stats_lock = self.mp_manager.Lock()
         self.workers = dict()
@@ -158,6 +173,10 @@ class LazyWorkerPool:
     def safe_get_stat(self, key):
         with self.stats_lock:
             return self.worker_stats[key]
+    
+    def safe_set_stat(self, key, value):
+        with self.stats_lock:
+            self.worker_stats[key] = value
 
     @property
     def total_workers(self):
@@ -178,6 +197,10 @@ class LazyWorkerPool:
     @property
     def jobs_completed(self):
         return self.safe_get_stat('jobs_completed')
+
+    @property
+    def enabled(self):
+        return self.safe_get_stat('enabled')
 
     def scale_workers_to(self, target_workers: int):
         """Scale to target number of workers"""
@@ -234,7 +257,7 @@ class LazyWorkerPool:
         return -removed
 
     def submit_job(self, job):
-        if self.accepting_jobs:
+        if self.enabled:
             self.in_flight[str(job)] = job
             self.worker_job_queue.put({'job': job})
             return True
@@ -266,15 +289,19 @@ class LazyWorkerPool:
         logger.info(f"{self.name}: shutdown complete") 
 
     def kill_all_workers(self):
-        """Immediately terminate all workers"""
-        for pid, proc in list(self.workers.items()):
-            proc.terminate()  # SIGTERM
+        # SIGTERM all at once
+        for proc in self.workers.values():
+            proc.terminate()
         
-        # Brief wait, then force kill
         sleep(0.5)
-        for pid, proc in list(self.workers.items()):
+        
+        # SIGKILL any survivors
+        for proc in self.workers.values():
             if proc.is_alive():
-                proc.kill()  # SIGKILL
+                proc.kill()
+        
+        # Wait for all at once
+        for proc in self.workers.values():
             proc.join(timeout=1)
         
         self.workers.clear()
@@ -288,10 +315,10 @@ class LazyWorkerPool:
         self.in_flight.pop(str(job), None)
 
     def enable(self):
-        self.accepting_jobs = True
+        self.safe_set_stat('enabled', True)
 
     def disable(self, reque=True):
-        self.accepting_jobs = False
+        self.safe_set_stat('enabled', False)
         self.kill_all_workers()
         if reque:
             for job in self.in_flight.values(): # Requeue in-flight jobs (put back in own queue)
@@ -320,7 +347,7 @@ class ResourceAwareScheduler:
                 self.worker_pools[pool.device] = pool
         
         # Job tracking
-        self.job_queue = mp.Queue()
+        self.scheduler_job_queue = mp.Queue()
         self.job_completion_times = []  # Circular buffer for completion times
         self.max_completion_history = 20
         self.total_queued_jobs = 0
@@ -343,7 +370,7 @@ class ResourceAwareScheduler:
     
     @property
     def jobs_in_queue(self):
-        return self.job_queue.qsize()
+        return self.scheduler_job_queue.qsize()
 
     @property
     def jobs_in_flight(self):
@@ -407,9 +434,9 @@ class ResourceAwareScheduler:
             self.submit_thread.join(timeout=5)
         
         # Drain job queue
-        while not self.job_queue.empty():
+        while not self.scheduler_job_queue.empty():
             try:
-                self.job_queue.get_nowait()
+                self.scheduler_job_queue.get_nowait()
             except:
                 break
         
@@ -429,11 +456,11 @@ class ResourceAwareScheduler:
        return False
 
     def _add_job(self, job, max_queue_size=1000):
-        while self.job_queue.qsize() >= max_queue_size:
+        while self.scheduler_job_queue.qsize() >= max_queue_size:
             if not self.running:
                 return False
             sleep(5)
-        self.job_queue.put(job)
+        self.scheduler_job_queue.put(job)
         self.total_queued_jobs += 1
         return True
 
@@ -468,9 +495,9 @@ class ResourceAwareScheduler:
         """Handle job completion - release resources (if a job was launched resources were reserved)"""
         job = result['job']
         device = result['device']
-        self.worker_pools[device].mark_completed(job) 
         
         if result['status'] == 'completed':
+            self.worker_pools[device].mark_completed(job) 
             # Track completion time
             completion_time = result['stop_time'] - result['start_time']
             self.job_completion_times.append(completion_time)
@@ -478,14 +505,14 @@ class ResourceAwareScheduler:
                 self.job_completion_times.pop(0)
             logger.info(f"Completed job {job.i}-{job.j} on device {device}")
             
-        # Handle errors
+        # Handle errors: known errors → retry job
         elif result['status'] == 'error':
             if result.get('error_type') == 'OOM':
                 logger.error(f"OOM job {job.i}-{job.j} on device {device}")
                 self._handle_oom(device)
             else:
+                self.worker_pools[device].mark_completed(job) 
                 logger.error(f"Unknown error on job {job.i}-{job.j} on device {device}")
-            logger.warning(f"Putting {job.i}-{job.j} back in job_queue")
 
         self.resource_manager.release_resources(device)
 
@@ -501,13 +528,13 @@ class ResourceAwareScheduler:
             return
         for _ in range(n_jobs):
             try:
-                job = self.job_queue.get(timeout=0.1)
+                job = self.scheduler_job_queue.get(timeout=0.1)
                 if self._try_schedule_job(job):
                     logger.info(f"Scheduled job {job.i}-{job.j}")
                 else:
                     logger.debug(f"Failed to schedule job {job.i}-{job.j}")
                     # Put back in queue
-                    self.job_queue.put(job)
+                    self.scheduler_job_queue.put(job)
                     break
             except queue.Empty:
                 pass
@@ -565,6 +592,10 @@ class ResourceAwareScheduler:
                         if result is None:
                             break
                         self._handle_job_completion(result)
+                    
+                        # Recovery check
+                        if pool.total_workers == 0 and pool.backlog > 0:
+                            pool.scale_workers_to(1)
 
                 # Adjust concurrency based on completion rate
                 if (self.completed_count - self.last_completed_count >= self.scaling_threshold) and self.running:
@@ -654,6 +685,8 @@ def generic_parallel_grid_search(
                         pbar.n = scheduler.completed_count
                         pbar.refresh()
                         sleep(0.5)
+
+            # TODO write results as we go
                         
             # Extract results from shared state
             shared = job_generator.shared 
