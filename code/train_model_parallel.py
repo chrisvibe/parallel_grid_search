@@ -3,13 +3,14 @@ from time import sleep, time
 import queue
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process
+from multiprocessing.managers import SyncManager
 from torch import set_num_threads, set_num_interop_threads
 import psutil
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 import threading
 from typing import Tuple, Callable, List, Dict, Any
-from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager
+from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager, GenericJobGenerator 
 import errno
 from os import waitpid, WNOHANG
 import torch
@@ -301,7 +302,7 @@ class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
 
 
-    def __init__(self, resource_manager: ComputeJobResourceManager, manager, scheduler_loop_delay:int=1):
+    def __init__(self, resource_manager: ComputeJobResourceManager, manager: SyncManager, job_generator: GenericJobGenerator, scheduler_loop_delay:int=1):
         # Control
         self.resource_manager = resource_manager
         self.running = False
@@ -328,6 +329,9 @@ class ResourceAwareScheduler:
         # Scaling parameters
         self.scaling_threshold = 1  # jobs per scaling
         self.job_buffer = int(round(self.target_concurrency * 1/4 + 0.5))
+
+        self._start(job_generator)
+            
 
     @property
     def target_concurrency_split_by_resource(self):
@@ -361,7 +365,7 @@ class ResourceAwareScheduler:
     def average_completion_time(self):
         return sum(self.job_completion_times) / len(self.job_completion_times) if self.job_completion_times else self.scheduler_loop_delay
         
-    def start(self, job_generator):
+    def _start(self, job_generator):
         """Start scheduler + job submission"""
         self.running = True
         self._start_job_submission(job_generator)
@@ -566,7 +570,8 @@ class ResourceAwareScheduler:
                 if (self.completed_count - self.last_completed_count >= self.scaling_threshold) and self.running:
                     self._adjust_concurrency()
 
-                if self.submission_complete and self.completed_count >= self.total_queued_jobs:
+                if self.submission_complete and (self.completed_count >= self.total_queued_jobs):
+                    logger.info("Scheduler loop exit condition met")
                     break  # Exit loop, cleanup will happen in finally
                 else:
                     sleep(self.scheduler_loop_delay)
@@ -587,7 +592,7 @@ class ResourceAwareScheduler:
 def generic_parallel_grid_search(
     # Core parameters
     job_factory: Callable,
-    total_jobs: int,
+    total_configs: int,
     samples_per_config: int,
     output_path: Path,
     save_config: Callable[[Path], None],
@@ -637,28 +642,19 @@ def generic_parallel_grid_search(
     try:
         job_generator = GenericJobGenerator(manager=manager,
                                  job_factory=job_factory,
-                                 total_jobs=total_jobs,
+                                 total_configs=total_configs,
                                  samples_per_config=samples_per_config,
                                  )
-        with ResourceAwareScheduler(resource_manager=resource_manager, manager=manager) as scheduler:
-            scheduler.start(job_generator)
-            
-            # Wait for completion
+        with ResourceAwareScheduler(resource_manager=resource_manager, manager=manager, job_generator=job_generator) as scheduler:
             start_time = time()
             with logging_redirect_tqdm():
-                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="job") as pbar:
-                    last_count = 0
-                    while last_count < total_jobs and scheduler.running:
-                        current_count = scheduler.completed_count
-                        pbar.update(current_count - last_count)
-                        last_count = current_count
+                total_jobs = len(job_generator)
+                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="jobs") as pbar:
+                    while pbar.n < total_jobs:
+                        pbar.n = scheduler.completed_count
+                        pbar.refresh()
                         sleep(0.5)
-            
-            if scheduler.completed_count == total_jobs:
-                elapsed_time = time() - start_time
-                logger.info(f"Grid search completed in {elapsed_time:.1f}s")
-            logger.info("Exiting scheduler context manager")
-                
+                        
             # Extract results from shared state
             shared = job_generator.shared 
             locks = job_generator.locks
@@ -666,9 +662,10 @@ def generic_parallel_grid_search(
                 history = list(shared.get('history', []))
             with locks.get('best_params', locks):
                 best_params = dict(shared.get('best_params', {}))
-            logger.info("Exiting job generator context manager")
-
+            
         # Process results with provided callback
+        elapsed_time = time() - start_time
+        logger.info(f"Grid search completed in {elapsed_time:.1f}s")
         process_results(history, best_params, output_path)
         logger.info(f"Saved {len(history)} results to {output_path}")
         

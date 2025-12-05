@@ -79,8 +79,7 @@ class SimpleParams:
     n_features: int = 10
     noise: float = 0.1
     seed: int = 42
-    test_oom_on_job = '5-1'
-
+    test_oom_on_job = '5-1' # triggers out-of-memory
 
 class SimpleLinearJob(JobInterface):
     """Job implementation for simple linear model training"""
@@ -234,15 +233,8 @@ def create_parameter_combinations():
             params = SimpleParams(
                 learning_rate=lr,
                 hidden_size=hidden_size,
-                epochs=50,
-                batch_size=32,
-                n_samples=1000,
-                n_features=10,
-                noise=0.1,
-                seed=42
             )
             combinations.append(params)
-    
     return combinations
 
 
@@ -324,7 +316,7 @@ def simple_parallel_grid_search(
     logger.info("Starting parallel grid search...")
     history, best_params = generic_parallel_grid_search(
         job_factory=factory,
-        total_jobs=len(param_combinations),
+        total_configs=len(param_combinations),
         samples_per_config=samples_per_config,
         output_path=output_path,
         gpu_memory_per_job_gb=gpu_memory_per_job_gb,
