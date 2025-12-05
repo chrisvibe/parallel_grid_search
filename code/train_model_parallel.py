@@ -10,12 +10,10 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 import threading
 from typing import Tuple, Callable, List, Dict, Any
-from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager, GenericJobGenerator 
+from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager, JobInterface
 import errno
 from os import waitpid, WNOHANG
 import torch
-import traceback
-import sys
 
 if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method('spawn')
@@ -49,23 +47,15 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                 enabled = False
                 with stats_lock:
                     enabled = worker_stats['enabled']
-
                 if enabled:
-                    print("get job...")
-                    job_data = job_queue.get(timeout=1.0)
-
+                    job_data = job_queue.get(timeout=.1)
                     if job_data is None:
-                        print("breaking...")
                         break
-
-                    print("work...")
                 else:
-                    print("cant work...")
-                    time.sleep(0.2)
+                    sleep(3)
             except queue.Empty:
-                # No job available
-                break
-                # continue # TODO decide
+                sleep(1)
+                continue
            
             # Transition from idle -> busy
             with stats_lock:
@@ -123,10 +113,6 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
                     except Exception as e:
                         logger.error(f"Job cleanup error: {e}")
     
-    except KeyboardInterrupt: # TODO do we need??
-        logger.info("Worker received KeyboardInterrupt")
-        print("KeyboardInterrupt caught! Current stack:")
-        traceback.print_stack(file=sys.stdout)
     except ValueError as e:
         if "is closed" not in str(e):
             logger.exception(f"Worker error: {e}")
@@ -148,6 +134,14 @@ def zombie_reaping():
             if e.errno == errno.ECHILD:
                 break
 
+def drain_queue(queue):
+    while not queue.empty():
+        try:
+            queue.get_nowait()
+        except:
+            break
+
+
 class LazyWorkerPool:
     """Simplified worker pool that creates workers on demand"""
 
@@ -159,7 +153,7 @@ class LazyWorkerPool:
         self.worker_job_queue = mp.Queue()
         self.result_queue = mp.Queue()
         self.spawn_delay = spawn_rate 
-        self.in_flight = dict() 
+        self.accept_jobs = True
         
         self.mp_manager = manager 
         self.worker_stats = self.mp_manager.dict({
@@ -174,15 +168,15 @@ class LazyWorkerPool:
         
         self.name = device + '_pool'
         logger.info(f"{self.name} initialized with max_workers={max_workers}")
+
+    def safe_set_stat(self, key, value):
+        with self.stats_lock:
+            self.worker_stats[key] = value
     
     def safe_get_stat(self, key):
         with self.stats_lock:
             return self.worker_stats[key]
     
-    def safe_set_stat(self, key, value):
-        with self.stats_lock:
-            self.worker_stats[key] = value
-
     @property
     def total_workers(self):
         return self.busy_workers + self.idle_workers
@@ -262,8 +256,7 @@ class LazyWorkerPool:
         return -removed
 
     def submit_job(self, job):
-        if self.enabled:
-            self.in_flight[str(job)] = job
+        if self.enabled or job is None:
             self.worker_job_queue.put({'job': job})
             return True
         else:
@@ -286,14 +279,21 @@ class LazyWorkerPool:
     def shutdown(self, timeout=30):
         """Shutdown all workers and clean up resources"""
         logger.info(f"{self.name}: Initiating shutdown")
-        self.disable(reque=False)
+        self.disable()
+        self.softly_kill_all_workers()
+        self.hard_kill_all_workers()
         
         self.worker_job_queue.close()
         self.result_queue.close()
         
         logger.info(f"{self.name}: shutdown complete") 
+    
+    def softly_kill_all_workers(self):
+        drain_queue(self.worker_job_queue)
+        for _ in range(self.total_workers):
+            self.submit_job(None)
 
-    def kill_all_workers(self):
+    def hard_kill_all_workers(self):
         # SIGTERM all at once
         for proc in self.workers.values():
             proc.terminate()
@@ -316,20 +316,12 @@ class LazyWorkerPool:
             self.worker_stats['idle'] = 0
             self.worker_stats['busy'] = 0
     
-    def mark_completed(self, job):
-        self.in_flight.pop(str(job), None)
-
     def enable(self):
         self.safe_set_stat('enabled', True)
 
-    def disable(self, reque=True):
+    def disable(self):
         self.safe_set_stat('enabled', False)
-        self.kill_all_workers()
-        if reque:
-            for job in self.in_flight.values(): # Requeue in-flight jobs (put back in own queue)
-                self.worker_job_queue.put({'job': job})
-        self.in_flight.clear()
-
+    
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
 
@@ -378,7 +370,7 @@ class ResourceAwareScheduler:
         return self.scheduler_job_queue.qsize()
 
     @property
-    def jobs_in_flight(self):
+    def busy_workers(self):
         return sum(pool.busy_workers for pool in self.worker_pools.values()) 
 
     @property
@@ -439,11 +431,7 @@ class ResourceAwareScheduler:
             self.submit_thread.join(timeout=5)
         
         # Drain job queue
-        while not self.scheduler_job_queue.empty():
-            try:
-                self.scheduler_job_queue.get_nowait()
-            except:
-                break
+        drain_queue(self.scheduler_job_queue)
         
         # Shutdown worker pools
         for device, pool in self.worker_pools.items():
@@ -482,7 +470,7 @@ class ResourceAwareScheduler:
 
     def _calculate_spawn_delay(self):
         # Fast submission when under capacity
-        utilization = self.jobs_in_flight / max(1, self.target_concurrency)
+        utilization = self.busy_workers / max(1, self.target_concurrency)
         
         if utilization < 0.8:  # Under 80% capacity
             return 0  # No delay - fill up quickly!
@@ -502,7 +490,6 @@ class ResourceAwareScheduler:
         device = result['device']
         
         if result['status'] == 'completed':
-            self.worker_pools[device].mark_completed(job) 
             # Track completion time
             completion_time = result['stop_time'] - result['start_time']
             self.job_completion_times.append(completion_time)
@@ -514,18 +501,18 @@ class ResourceAwareScheduler:
         elif result['status'] == 'error':
             if result.get('error_type') == 'OOM':
                 logger.error(f"OOM job {job.i}-{job.j} on device {device}")
-                self._handle_oom(device)
+                self._handle_oom(device, job)
             else:
-                self.worker_pools[device].mark_completed(job) 
                 logger.error(f"Unknown error on job {job.i}-{job.j} on device {device}")
 
         self.resource_manager.release_resources(device)
 
-    def _handle_oom(self, device):
+    def _handle_oom(self, device, job: JobInterface):
         pool = self.worker_pools[device]
         pool.disable()
         self.resource_manager.handle_oom(pool.device)
         pool.enable()
+        pool.submit_job(job)
         logger.info(f"{pool.name} - {pool.device} recovered from OOM")
     
     def _schedule_jobs(self, n_jobs=1):
@@ -579,15 +566,15 @@ class ResourceAwareScheduler:
     def _scheduler_loop(self):
         """Main scheduler loop"""
         logger.info(f"Jobs in queue: {self.jobs_in_queue}")
-        logger.info(f"Jobs in flight: {self.jobs_in_flight}")
+        logger.info(f"Busy workers: {self.busy_workers}")
         
         try:
             while self.running:
                 # Schedule new jobs
                 zombie_reaping()
-                in_flight, backlog, job_buffer = self.jobs_in_flight, self.backlog, self.job_buffer
-                n_jobs = self.target_concurrency + job_buffer - backlog - in_flight
-                logger.debug(f'Schedule more? target: {self.target_concurrency_split_by_resource}, buffer: {job_buffer}, jobs-in-worker-backlog: {backlog}, in-flight: {in_flight} -> ' + (f'adding {n_jobs}' if n_jobs > 0 else f'no action {n_jobs}'))
+                busy_workers, backlog, job_buffer = self.busy_workers, self.backlog, self.job_buffer
+                n_jobs = self.target_concurrency + job_buffer - backlog - busy_workers
+                logger.debug(f'Schedule more? target: {self.target_concurrency_split_by_resource}, buffer: {job_buffer}, jobs-in-worker-backlog: {backlog}, busy-workers: {busy_workers} -> ' + (f'adding {n_jobs}' if n_jobs > 0 else f'no action {n_jobs}'))
                 if n_jobs > 0 and self.running:
                     self._schedule_jobs(n_jobs=n_jobs)
 
@@ -597,12 +584,6 @@ class ResourceAwareScheduler:
                         if result is None:
                             break
                         self._handle_job_completion(result)
-                    
-                        # Recovery check
-                        print('\n', 'here', pool.total_workers, pool.backlog)
-                        if pool.total_workers == 0 and pool.backlog > 0:
-                            print('recovering...')
-                            pool.scale_workers_to(1)
 
                 # Adjust concurrency based on completion rate
                 if (self.completed_count - self.last_completed_count >= self.scaling_threshold) and self.running:
@@ -619,7 +600,7 @@ class ResourceAwareScheduler:
         finally:
             logger.info("Scheduler loop exiting - draining remaining results")
             # Drain all remaining results
-            while self.jobs_in_flight > 0:
+            while self.busy_workers > 0:
                 for pool in self.worker_pools.values():
                     result = pool.get_result(timeout=1.0)
                     if result is not None:
@@ -687,7 +668,7 @@ def generic_parallel_grid_search(
             start_time = time()
             with logging_redirect_tqdm():
                 total_jobs = len(job_generator)
-                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="jobs") as pbar: # TODO per config or job?
+                with tqdm(total=total_jobs, desc="Grid Search Progress", unit="jobs") as pbar:
                     while pbar.n < total_jobs:
                         pbar.n = scheduler.completed_count
                         pbar.refresh()
@@ -709,9 +690,6 @@ def generic_parallel_grid_search(
         process_results(history, best_params, output_path)
         logger.info(f"Saved {len(history)} results to {output_path}")
         
-    except KeyboardInterrupt:
-        logger.info("Main function received KeyboardInterrupt, ensuring cleanup")
-        raise
     except Exception as e:
         logger.exception(f"Unexpected error in grid search: {e}")
         raise

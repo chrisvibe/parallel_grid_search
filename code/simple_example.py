@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from dataclasses import dataclass
-import time
+from time import time
 import logging
 import pandas as pd
 from copy import deepcopy
@@ -80,7 +80,8 @@ class SimpleParams:
     n_features: int = 10
     noise: float = 0.1
     seed: int = 42
-    test_oom_on_job = '5-1' # triggers out-of-memory
+    test_oom = True # triggers out-of-memory
+    test_oom_job_id = '5-1' # trigger
 
 class SimpleLinearJob(JobInterface):
     """Job implementation for simple linear model training"""
@@ -94,7 +95,8 @@ class SimpleLinearJob(JobInterface):
         """Run training job on specified device"""
         logger.info(f"{self.get_log_prefix()} Starting on {device}")
 
-        if str(self) == self.params.test_oom_on_job:
+        if self.params.test_oom and (self.params.test_oom_job_id == str(self)):
+            self.params.test_oom = False
             raise torch.cuda.OutOfMemoryError("Fake OOM for testing")
         
         # Set seed for reproducibility
@@ -102,7 +104,7 @@ class SimpleLinearJob(JobInterface):
         if device.type == 'cuda':
             torch.cuda.manual_seed(self.params.seed)
         
-        start_time = time.time()
+        start_time = time()
         
         # Create dataset
         with self.locks['dataset_lock']:
@@ -122,7 +124,7 @@ class SimpleLinearJob(JobInterface):
         # Train model
         final_loss, final_accuracy = self._train_model(model, dataset)
         
-        training_time = time.time() - start_time
+        training_time = time() - start_time
         
         # Create results
         results = {
@@ -363,6 +365,6 @@ if __name__ == "__main__":
         output_path=SimpleParams.out_path,
         samples_per_config=2,  # Reduced for demo
         gpu_memory_per_job_gb=0.5,
-        cpu_memory_per_job_gb=0.5,
+        cpu_memory_per_job_gb=1.0,
         cpu_cores_per_job=1
     )
