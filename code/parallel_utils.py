@@ -233,7 +233,7 @@ class CPUJobResourceManager:
             'swap_percent': psutil.swap_memory().percent,
         }
    
-    def can_allocate_job(self):
+    def has_available_cpu(self):
         """Check if resources are available for a new job"""
         # First check against max concurrent limit
         if self.allocated_jobs >= self.max_jobs:
@@ -275,7 +275,7 @@ class CPUJobResourceManager:
     
     def try_allocate_cpu(self):
         """Try to allocate resources for a job"""
-        if self.can_allocate_job():
+        if self.has_available_cpu():
             self.allocated_jobs += 1
             # logger.debug(f'Incremented job count {self.allocated_jobs}/{self.max_jobs}')
             return True
@@ -318,7 +318,7 @@ class CPUJobResourceManager:
         """Get total available CPU cores"""
         return self.available_cpus
 
-    def adjust_target_concurrency(self):
+    def adjust_concurrency(self):
         if self.should_decrease_concurrency():
             self.target_concurrency -= 1
         elif self.should_increase_concurrency():
@@ -331,37 +331,31 @@ class CPUJobResourceManager:
         return False
 
     def should_increase_concurrency(self):
-        return self.can_allocate_job() and (self.target_concurrency < self.max_jobs)
+        return self.has_available_cpu() and (self.target_concurrency < self.max_jobs)
 
 
 class GPUJobResourceManager:
-    def __init__(self, memory_per_job_gb=2.0, buffer_mb=100, memory_reset_threshold=0.9, initial_concurrency=2):
+    def __init__(self, memory_per_job_gb=2.0, buffer_gb=0.1, initial_concurrency=2):
         self.memory_per_job_gb = memory_per_job_gb
-        self.buffer_mb = buffer_mb
-        self.memory_reset_threshold = memory_reset_threshold
+        self.buffer_gb = buffer_gb
         self.initial_concurrency = initial_concurrency
         
-        # Simple counters (no multiprocessing)
         self.gpu_allocated_jobs = {}
         self.gpu_target_concurrent = {}
         self.last_allocated_gpu = -1
         
-        # Unified metrics tracking
         self.gpu_metrics = defaultdict(lambda: {
             'memory_util': {'history': deque(maxlen=10), 'ewma': 0.0},
             'compute_util': {'history': deque(maxlen=10), 'ewma': 0.0},
             'last_sample_time': {'memory': 0, 'compute': 0}
         })
         self.sample_interval = 1.0
-        self.ewma_alpha = 0.3  # Exponential weighted moving average factor
+        self.ewma_alpha = 0.3
 
-        # Track utilization by concurrency level
-        self.concurrency_performance = defaultdict(lambda: defaultdict(lambda: {'ewma': 0.0}))
-
-        # other thresholds
-        self.avg_memory_util_thresh = 0.85
-        self.low_avg_compute_util_threash = 0.1
-        self.high_avg_compute_util_threash = 0.9
+        # Thresholds
+        self.memory_util_threshold = 0.85
+        self.compute_increase_threshold = 0.90   # Increase concurrency if below
+        self.compute_saturated_threshold = 0.98  # Decrease concurrency if at/above
         
         self._init_slurm_gpus()
         self._init_pynvml()
@@ -370,21 +364,18 @@ class GPUJobResourceManager:
         """Initialize only GPUs allocated by SLURM"""
         self.available_gpus = []
         
-        # Check SLURM GPU allocation
         slurm_gpus = environ.get('CUDA_VISIBLE_DEVICES')
         if slurm_gpus:
             try:
                 self.available_gpus = [int(gpu.strip()) for gpu in slurm_gpus.split(',')]
                 logger.info(f"SLURM allocated GPUs: {self.available_gpus}")
             except ValueError:
-                logger.error(f"Invalid CUDA_VISIBLE_DEVICES format: {slurm_gpus}")
                 raise RuntimeError(f"Cannot parse CUDA_VISIBLE_DEVICES: {slurm_gpus}")
         
-        # Fallback: use all available GPUs if no SLURM allocation
         if not self.available_gpus:
             if torch.cuda.is_available():
                 self.available_gpus = list(range(torch.cuda.device_count()))
-                logger.info(f"No SLURM GPU allocation found. Using all GPUs: {self.available_gpus}")
+                logger.info(f"No SLURM allocation. Using all GPUs: {self.available_gpus}")
             else:
                 raise RuntimeError("No GPUs available and CUDA not available")
 
@@ -393,12 +384,9 @@ class GPUJobResourceManager:
         try:
             pynvml.nvmlInit()
         except Exception as e:
-            logger.error(f"Failed to initialize pynvml: {e}")
-            raise RuntimeError("pynvml initialization failed")
+            raise RuntimeError(f"pynvml initialization failed: {e}")
         
         failed_gpus = []
-        
-        # Initialize tracking for available GPUs only
         for gpu_id in self.available_gpus:
             try:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
@@ -408,16 +396,14 @@ class GPUJobResourceManager:
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 
                 logger.info(f"GPU {gpu_id}: {device_name}, "
-                               f"Total Memory: {mem_info.total/(1024**3):.2f}GB")
+                           f"Total Memory: {mem_info.total/(1024**3):.2f}GB")
                 
                 self.gpu_allocated_jobs[gpu_id] = 0
                 self.gpu_target_concurrent[gpu_id] = self.initial_concurrency
-                
             except Exception as e:
                 logger.warning(f"Failed to initialize GPU {gpu_id}: {e}")
                 failed_gpus.append(gpu_id)
         
-        # Remove failed GPUs after iteration
         for gpu_id in failed_gpus:
             self.available_gpus.remove(gpu_id)
         
@@ -426,31 +412,20 @@ class GPUJobResourceManager:
 
     def _update_metric(self, gpu_id, metric_type, value, force_update=False):
         """Update metric with history tracking and EWMA calculation"""
-        current_time = time.time()
         metrics = self.gpu_metrics[gpu_id]
-        
-        # Check if we should update based on sample interval
         last_time_key = 'memory' if metric_type == 'memory_util' else 'compute'
-        should_update = (current_time - metrics['last_sample_time'][last_time_key] >= self.sample_interval) or force_update
+        current_time = time.time()
         
-        if should_update:
-            # Update history
+        if force_update or (current_time - metrics['last_sample_time'][last_time_key] >= self.sample_interval):
             metrics[metric_type]['history'].append(value)
             metrics['last_sample_time'][last_time_key] = current_time
             
-            # Update EWMA
-            if metrics[metric_type]['ewma'] == 0.0:
-                # Initialize EWMA with first value
-                metrics[metric_type]['ewma'] = value
-            else:
-                metrics[metric_type]['ewma'] = (self.ewma_alpha * value + 
-                                               (1 - self.ewma_alpha) * metrics[metric_type]['ewma'])
+            old_ewma = metrics[metric_type]['ewma']
+            metrics[metric_type]['ewma'] = value if old_ewma == 0.0 else (
+                self.ewma_alpha * value + (1 - self.ewma_alpha) * old_ewma
+            )
         
         return metrics[metric_type]['ewma']
-
-    def _get_metric_average(self, gpu_id, metric_type):
-        """Get average value for a metric (uses EWMA)"""
-        return self.gpu_metrics[gpu_id][metric_type]['ewma']
 
     def _get_gpu_memory_info(self, gpu_id):
         """Get current GPU memory usage with unified tracking"""
@@ -458,17 +433,10 @@ class GPUJobResourceManager:
             handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             
-            memory_utilization = mem_info.used / mem_info.total if mem_info.total > 0 else 0
+            utilization = mem_info.used / mem_info.total if mem_info.total > 0 else 0
+            avg_util = self._update_metric(gpu_id, 'memory_util', utilization)
             
-            # Update memory utilization using unified method
-            avg_memory_util = self._update_metric(gpu_id, 'memory_util', memory_utilization)
-            
-            # Trigger reset if threshold exceeded
-            if avg_memory_util > self.memory_reset_threshold:
-                self._mark_for_reset(gpu_id, avg_memory_util)
-            
-            return mem_info.total, mem_info.used, mem_info.free, avg_memory_util
-            
+            return mem_info.total, mem_info.used, mem_info.free, avg_util
         except Exception as e:
             logger.error(f"Error getting GPU {gpu_id} memory info: {e}")
             return 0, 0, 0, 0
@@ -479,161 +447,110 @@ class GPUJobResourceManager:
             handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
             util_samples = []
             
-            # Take multiple samples for stability
             for _ in range(samples):
                 util_samples.append(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
                 if samples > 1:
                     time.sleep(1.0 / samples)
             
-            compute_utilization = sum(util_samples) / len(util_samples) / 100.0  # Convert to 0-1 range
+            utilization = sum(util_samples) / len(util_samples) / 100.0
+            avg_util = self._update_metric(gpu_id, 'compute_util', utilization, force_update=True)
             
-            # Update compute utilization using unified method
-            avg_compute_util = self._update_metric(gpu_id, 'compute_util', compute_utilization, force_update=True)
-            
-            # Update concurrency performance tracking
-            concurrency_level = self.gpu_target_concurrent[gpu_id]
-            self._update_concurrency_performance(gpu_id, concurrency_level, compute_utilization)
-            
-            return compute_utilization, avg_compute_util
-            
+            return utilization, avg_util
         except Exception as e:
             logger.warning(f"Failed to get GPU {gpu_id} compute utilization: {e}")
-            return 1.0, 1.0  # Assume high utilization on error
+            return 1.0, 1.0  # Assume saturated on error
 
-    def _update_concurrency_performance(self, gpu_id, concurrency_level, utilization):
-        """Track performance at different concurrency levels"""
-        perf = self.concurrency_performance[gpu_id][concurrency_level]
-        if perf['ewma'] == 0.0:
-            perf['ewma'] = utilization
-        else:
-            perf['ewma'] = self.ewma_alpha * utilization + (1 - self.ewma_alpha) * perf['ewma']
-
-    def can_allocate_job_on_this_gpu(self, gpu_id):
-        """Check if we can allocate a job to this GPU"""
-        if gpu_id not in self.available_gpus:
-            return False
-        
+    def _has_memory_capacity(self, gpu_id):
+        """Check if GPU has enough memory for another job"""
         try:
-            mem_total, mem_used, mem_free, avg_memory_util = self._get_gpu_memory_info(gpu_id)
-            required_memory_bytes = (self.memory_per_job_gb * 1024**3) + (self.buffer_mb * 1024**2)
-            
-            # Don't allocate if average usage too high
-            if avg_memory_util > self.avg_memory_util_thresh:
-                return False
-                
-            return mem_free >= required_memory_bytes
-            
-        except Exception as e:
-            logger.error(f"Error checking GPU {gpu_id}: {e}")
-            return False
-
-    def should_increase_concurrency(self, gpu_id):
-        """Check if we should increase concurrency on this GPU"""
-        if gpu_id not in self.available_gpus or self.has_pending_resets():
-            return False
-        
-        if self.gpu_allocated_jobs[gpu_id] < self.gpu_target_concurrent[gpu_id]:
-            return False
-
-        # Check memory availability
-        try:
-            mem_total, mem_used, mem_free, avg_memory_util = self._get_gpu_memory_info(gpu_id)
-            required_memory_bytes = (self.memory_per_job_gb * 1024**3) + (self.buffer_mb * 1024**2)
-            
-            if avg_memory_util > self.avg_memory_util_thresh or mem_free < required_memory_bytes:
-                return False
-                
+            _, _, mem_free, avg_util = self._get_gpu_memory_info(gpu_id)
+            required_bytes = (self.memory_per_job_gb + self.buffer_gb) * 1024**3
+            return avg_util <= self.memory_util_threshold and mem_free >= required_bytes
         except Exception as e:
             logger.error(f"Error checking GPU {gpu_id} memory: {e}")
             return False
 
-        # Check compute utilization
-        _, avg_compute_util = self._get_gpu_compute_utilization(gpu_id)
-        
-        # Only increase if compute utilization is moderate (not too low, not too high)
-        return self.low_avg_compute_util_threash < avg_compute_util <= self.high_avg_compute_util_threash
+    def _can_allocate_on_gpu(self, gpu_id):
+        """Check if we can allocate a job to this GPU"""
+        return gpu_id in self.available_gpus and self._has_memory_capacity(gpu_id)
 
-    def should_decrease_concurrency(self, gpu_id):
+    def _should_increase_concurrency(self, gpu_id):
+        """Check if we should increase concurrency on this GPU"""
+        if gpu_id not in self.available_gpus:
+            return False
+        
+        # Only raise ceiling if we've hit it
+        if self.gpu_allocated_jobs[gpu_id] < self.gpu_target_concurrent[gpu_id]:
+            return False
+
+        if not self._has_memory_capacity(gpu_id):
+            return False
+
+        _, avg_compute = self._get_gpu_compute_utilization(gpu_id)
+        return avg_compute < self.compute_increase_threshold
+
+    def _should_decrease_concurrency(self, gpu_id):
         """Check if we should decrease concurrency on this GPU"""
         if gpu_id not in self.available_gpus:
             return False
-            
-        perf_data = self.concurrency_performance[gpu_id]
-        if len(perf_data) < 2:
+        
+        if self.gpu_target_concurrent[gpu_id] <= 1:
             return False
             
-        current_level = self.gpu_target_concurrent[gpu_id]
-        
-        # Find best performing concurrency level (prefer lower concurrency)
-        best_level = max(perf_data.keys(), key=lambda l: (perf_data[l]['ewma'], -l))
-        
-        # Decrease if current level performs worse than best level
-        return current_level > best_level and current_level > 1
+        _, avg_compute = self._get_gpu_compute_utilization(gpu_id)
+        return avg_compute >= self.compute_saturated_threshold
     
-    def can_allocate_job(self):
-        """Check if a GPU is available for allocation (does not mutate state)."""
+    def has_available_gpu(self):
+        """Check if a GPU is available for allocation (does not mutate state)"""
         return self._get_next_available_gpu(allocate=False) is not None
 
     def try_allocate_gpu(self):
-        """Try to allocate a GPU for a new job (mutates state)."""
+        """Try to allocate a GPU for a new job (mutates state)"""
         gpu_id = self._get_next_available_gpu(allocate=True)
         if gpu_id is None:
-            logger.debug("No GPU could be allocated (all at capacity or pending reset)")
+            logger.debug("No GPU could be allocated (all at capacity)")
         return gpu_id
     
-    def _get_next_available_gpu(self, allocate: bool = False):
-        """Shared logic for GPU selection.
-
-        Args:
-            allocate (bool): If True, will increment job counter and update allocation state.
-        
-        Returns:
-            gpu_id or None
-        """
+    def _get_next_available_gpu(self, allocate=False):
+        """Round-robin GPU selection with optional allocation"""
         if not self.available_gpus:
             return None
 
         gpu_count = len(self.available_gpus)
-        start_index = self.last_allocated_gpu
-
         for i in range(gpu_count):
-            index = (start_index + 1 + i) % gpu_count
+            index = (self.last_allocated_gpu + 1 + i) % gpu_count
             gpu_id = self.available_gpus[index]
 
-            current_jobs = self.gpu_allocated_jobs[gpu_id]
-            max_jobs = self.gpu_target_concurrent[gpu_id]
+            current = self.gpu_allocated_jobs[gpu_id]
+            target = self.gpu_target_concurrent[gpu_id]
 
-            if current_jobs < max_jobs and self.can_allocate_job_on_this_gpu(gpu_id):
+            if current < target and self._can_allocate_on_gpu(gpu_id):
                 if allocate:
                     self.last_allocated_gpu = index
                     self.gpu_allocated_jobs[gpu_id] += 1
-                    logger.debug(f"Allocated GPU {gpu_id} "
-                                    f"({self.gpu_allocated_jobs[gpu_id]}/{max_jobs} jobs)")
+                    logger.debug(f"Allocated GPU {gpu_id} ({current + 1}/{target} jobs)")
                 return gpu_id
 
         return None
 
     def release(self, gpu_id):
-        """Release GPU and perform reset if needed"""
+        """Release GPU after job completion"""
         if gpu_id in self.gpu_allocated_jobs:
-            self.gpu_allocated_jobs[gpu_id] -= 1 
+            self.gpu_allocated_jobs[gpu_id] = max(0, self.gpu_allocated_jobs[gpu_id] - 1)
             
     def handle_oom(self, gpu_id):
         """Handle out-of-memory error"""
         logger.warning(f"OOM on GPU {gpu_id}")
         
-        # Reset allocation tracking
         if gpu_id in self.gpu_allocated_jobs:
             self.gpu_allocated_jobs[gpu_id] = 0
         
-        # Clear metrics (stale after OOM)
+        # Clear stale metrics
         metrics = self.gpu_metrics[gpu_id]
-        metrics['memory_util']['history'].clear()
-        metrics['memory_util']['ewma'] = 0.0
-        metrics['compute_util']['history'].clear()
-        metrics['compute_util']['ewma'] = 0.0
+        for key in ('memory_util', 'compute_util'):
+            metrics[key]['history'].clear()
+            metrics[key]['ewma'] = 0.0
         
-        # Cache clear
         try:
             with torch.cuda.device(gpu_id):
                 torch.cuda.empty_cache()
@@ -648,22 +565,17 @@ class GPUJobResourceManager:
             try:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                mem_free_gb = mem_info.free / (1024**3)
-                mem_util_pct = (mem_info.used / mem_info.total) * 100
                 
                 jobs = self.gpu_allocated_jobs[gpu_id]
-                max_jobs = self.gpu_target_concurrent[gpu_id]
+                target = self.gpu_target_concurrent[gpu_id]
+                avg_mem = self.gpu_metrics[gpu_id]['memory_util']['ewma'] * 100
+                avg_compute = self.gpu_metrics[gpu_id]['compute_util']['ewma'] * 100
                 
-                # Get average metrics
-                avg_mem = self._get_metric_average(gpu_id, 'memory_util') * 100
-                avg_compute = self._get_metric_average(gpu_id, 'compute_util') * 100
-                
-                status_str = f"GPU {gpu_id}: {jobs}/{max_jobs} jobs, " \
-                           f"{mem_free_gb:.1f}GB free, {mem_util_pct:.0f}% mem used " \
-                           f"(avg: {avg_mem:.0f}% mem, {avg_compute:.0f}% compute)"
-                
-                status.append(status_str)
-                
+                status.append(
+                    f"GPU {gpu_id}: {jobs}/{target} jobs, "
+                    f"{mem_info.free/(1024**3):.1f}GB free "
+                    f"(avg: {avg_mem:.0f}% mem, {avg_compute:.0f}% compute)"
+                )
             except Exception:
                 status.append(f"GPU {gpu_id}: unavailable")
         
@@ -673,28 +585,20 @@ class GPUJobResourceManager:
         """Get total job capacity across all GPUs"""
         return sum(self.gpu_target_concurrent[gpu_id] for gpu_id in self.available_gpus)
 
-    def adjust_target_concurrency(self):
+    def adjust_concurrency(self):
+        """Adjust concurrency for all GPUs based on utilization"""
         for gpu_id in self.available_gpus:
-            self._adjust_target_concurrency(gpu_id)
+            if self.gpu_allocated_jobs.get(gpu_id, 0) == 0:
+                continue
+                
+            if self._should_increase_concurrency(gpu_id):
+                self.gpu_target_concurrent[gpu_id] += 1
+                logger.debug(f"Increased GPU {gpu_id} concurrency to {self.gpu_target_concurrent[gpu_id]}")
+            elif self._should_decrease_concurrency(gpu_id):
+                self.gpu_target_concurrent[gpu_id] -= 1
+                logger.debug(f"Decreased GPU {gpu_id} concurrency to {self.gpu_target_concurrent[gpu_id]}")
+        
         return self.gpu_target_concurrent
-
-    def _adjust_target_concurrency(self, gpu_id):
-        """Adjust concurrency based on performance metrics"""
-        if gpu_id not in self.gpu_allocated_jobs or self.gpu_allocated_jobs[gpu_id] == 0:
-            return False
-            
-        if self.should_increase_concurrency(gpu_id):
-            self.gpu_target_concurrent[gpu_id] += 1
-            logger.debug(f"Increased GPU {gpu_id} concurrency limit to {self.gpu_target_concurrent[gpu_id]}")
-            logger.debug(self.get_status())
-            return True
-        elif self.should_decrease_concurrency(gpu_id):
-            self.gpu_target_concurrent[gpu_id] = max(1, self.gpu_target_concurrent[gpu_id] - 1)
-            logger.debug(f"Decreased GPU {gpu_id} concurrency limit to {self.gpu_target_concurrent[gpu_id]}")
-            logger.debug(self.get_status())
-            return True
-            
-        return False
 
     def get_metrics_summary(self, gpu_id):
         """Get a summary of metrics for a GPU"""
@@ -712,9 +616,9 @@ class GPUJobResourceManager:
                 'current': metrics['compute_util']['history'][-1] if metrics['compute_util']['history'] else 0,
                 'average': metrics['compute_util']['ewma'],
                 'history': list(metrics['compute_util']['history'])
-            },
-            'concurrency_performance': dict(self.concurrency_performance[gpu_id])
+            }
         }
+    
 
 class ComputeJobResourceManager:
     def __init__(self, cpu_memory_per_job_gb=2.0, cpu_cores_per_job=1, gpu_memory_per_job_gb=2.0):
@@ -800,7 +704,7 @@ class ComputeJobResourceManager:
         return self.cpu_manager.cores_per_job
 
     def adjust_target_concurrency(self):
-        self.cpu_manager.adjust_target_concurrency()
+        self.cpu_manager.adjust_concurrency()
         if self.use_gpu:
-            self.gpu_manager.adjust_target_concurrency()
+            self.gpu_manager.adjust_concurrency()
         return self.target_concurrency_split_by_resource 

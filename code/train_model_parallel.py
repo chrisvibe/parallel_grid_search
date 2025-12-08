@@ -23,106 +23,85 @@ logger = logging.getLogger(__name__)
 
 
 def worker_function(job_queue, result_queue, cores_per_job, priority, worker_stats, stats_lock, device):
-    """Worker with proper stat tracking"""
-    set_num_interop_threads(1)
-    set_num_threads(cores_per_job)
-    p = psutil.Process()
+    # assumption is that this function has no errors, but jobs may and are dealt with in job results outside of this function
+    def init(cores_per_job, device):
+        """Worker with proper stat tracking"""
+        set_num_interop_threads(1)
+        set_num_threads(cores_per_job)
+        p = psutil.Process()
+        
+        if device.type == 'cuda':
+            torch.cuda.set_device(device.index)
+        
+        try:
+            p.nice(priority)
+        except (psutil.AccessDenied, PermissionError):
+            pass
 
-    if device.type == 'cuda':
-        torch.cuda.set_device(device.index)
-    
-    # Set process priority
-    try:
-        p.nice(priority)
-    except (psutil.AccessDenied, PermissionError):
-        pass
-    
-    # Register worker as idle
-    with stats_lock:
-        worker_stats['idle'] += 1
-    
-    try:
-        while True:
-            try:
-                enabled = False
-                with stats_lock:
-                    enabled = worker_stats['enabled']
-                if enabled:
-                    job_data = job_queue.get(timeout=.1)
-                    if job_data is None:
-                        break
-                else:
-                    sleep(3)
-            except queue.Empty:
-                sleep(1)
-                continue
-           
-            # Transition from idle -> busy
-            with stats_lock:
-                worker_stats['idle'] -= 1
-                worker_stats['busy'] += 1
-            
-            job_completed_successfully = False
-            try:
-                job = job_data['job']
-                
-                # Run job
-                start_time = time()
-                result = job.run(device)
-                zombie_reaping()
-                
-                # Add metadata
-                result.update({
-                    'job': job,
-                    'device': device,
-                    'worker_pid': p.pid,
-                    'start_time': start_time,
-                    'stop_time': time(),
-                })
-                job_completed_successfully = (result.get('status') != 'error')
-                result_queue.put(result)
+        update_stats(idle=1)
+        return p
 
-                logger.debug(f"Worker completed job {job.i}-{job.j} on {device}")
-                
-            except Exception as e:
-                logger.exception(f"Job execution error: {e}")
-                error_result = {
-                    'status': 'error', 
-                    'error_type': 'general', 
-                    'error': str(e),
-                    'job': job if 'job' in locals() else None,
-                    'device': device if 'device' in locals() else None,
-                    'worker_pid': p.pid
-                }
-                result_queue.put(error_result)
-                
-            finally:
-                # Always transition back to idle
-                with stats_lock:
-                    worker_stats['busy'] -= 1
-                    worker_stats['idle'] += 1
-                    if job_completed_successfully:
-                        worker_stats['jobs_completed'] += 1
-                    else:
-                        worker_stats['jobs_failed'] += 1
-                
-                # Cleanup job if needed
-                if 'job' in locals() and hasattr(job, 'cleanup'):
-                    try:
-                        job.cleanup()
-                    except Exception as e:
-                        logger.error(f"Job cleanup error: {e}")
-    
-    except ValueError as e:
-        if "is closed" not in str(e):
-            logger.exception(f"Worker error: {e}")
-    except Exception as e:
-        logger.exception(f"Worker error: {e}")
-    finally:
-        # Unregister worker
+    def update_stats(**kwargs):
         with stats_lock:
-            worker_stats['idle'] -= 1
-        logger.info("Worker shut down")
+            for k, v in kwargs.items():
+                worker_stats[k] += v
+
+    def get_enabled():
+        with stats_lock:
+            return worker_stats['enabled']
+
+    def set_enabled(val):
+        with stats_lock:
+            worker_stats['enabled'] = val
+
+    def run_job(job_data):
+        job = job_data['job']
+        start_time = time()
+        result = job.run(device)
+        result.update({
+            'job': job,
+            'device': device,
+            'worker_pid': p.pid,
+            'start_time': start_time,
+            'stop_time': time(),
+        })
+        return result
+    
+    p = init(cores_per_job, device)
+    while True:
+        if not get_enabled():
+            sleep(3)
+            continue
+
+        try:
+            job_data = job_queue.get(timeout=0.1)
+            if job_data is None:
+                break
+        except queue.Empty:
+            continue
+        except Exception:
+            break
+        
+        update_stats(idle=-1, busy=1)
+        result = run_job(job_data)
+
+        try:
+            result_queue.put(result)
+        except Exception:
+            pass
+
+        if result.get('status') == 'error':
+            update_stats(busy=-1, idle=1, jobs_failed=1)
+            set_enabled(False)
+        else:
+            update_stats(busy=-1, idle=1, jobs_completed=1)
+
+        if hasattr(result['job'], 'cleanup'):
+            result['job'].cleanup()
+
+        logger.debug(f"Worker completed job {result['job'].i}-{result['job'].j} on {device}")
+
+    update_stats(idle=-1)
 
 def zombie_reaping():
     while True:
@@ -509,7 +488,7 @@ class ResourceAwareScheduler:
 
     def _handle_oom(self, device, job: JobInterface):
         pool = self.worker_pools[device]
-        pool.disable()
+        pool.disable() # already disabled by worker but why not...
         self.resource_manager.handle_oom(pool.device)
         pool.enable()
         pool.submit_job(job)

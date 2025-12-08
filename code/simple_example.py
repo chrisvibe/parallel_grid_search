@@ -13,6 +13,7 @@ import logging
 import pandas as pd
 from copy import deepcopy
 from shutil import rmtree
+from pathlib import Path
 
 # Import the grid search framework
 from train_model_parallel import generic_parallel_grid_search
@@ -71,7 +72,7 @@ class SyntheticDataset:
 @dataclass
 class SimpleParams:
     """Parameter structure for the simple example"""
-    out_path: str = "out/simple_grid_search_results"
+    out_path: Path = "out/simple_grid_search_results"
     learning_rate: float = 0.01
     hidden_size: int = 64
     epochs: int = 50
@@ -354,11 +355,11 @@ if __name__ == "__main__":
     # resp = input(f"Are you sure you want to delete '{SimpleParams.out_path}'? (y/N): ").strip().lower()
     resp = 'y' # TODO remove
     if resp == 'y':
-        rmtree(SimpleParams.out_path)
+        if Path(SimpleParams.out_path).exists():
+            rmtree(SimpleParams.out_path)
         print("Directory deleted.")
     else:
         print("Canceled.")
-        rmtree(SimpleParams.out_path)
     
     # Run grid search
     history, best_params = simple_parallel_grid_search(
