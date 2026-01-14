@@ -7,13 +7,14 @@ This trains a single linear layer on synthetic data with different hyperparamete
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from dataclasses import dataclass
 from time import time
 import logging
 import pandas as pd
 from copy import deepcopy
 from shutil import rmtree
 from pathlib import Path
+import yaml
+from pydantic import BaseModel
 
 # Import the grid search framework
 from train_model_parallel import generic_parallel_grid_search
@@ -68,11 +69,9 @@ class SyntheticDataset:
         )
         return self
 
-
-@dataclass
-class SimpleParams:
+class SimpleParams(BaseModel):
     """Parameter structure for the simple example"""
-    out_path: Path = "out/simple_grid_search_results"
+    out_path: Path = Path("out/simple_grid_search_results")
     learning_rate: float = 0.01
     hidden_size: int = 64
     epochs: int = 50
@@ -81,8 +80,8 @@ class SimpleParams:
     n_features: int = 10
     noise: float = 0.1
     seed: int = 42
-    test_oom = True # triggers out-of-memory
-    test_oom_job_id = '5-1' # trigger
+    test_oom: bool = True
+    test_oom_job_id: str = '5-1'
 
 class SimpleLinearJob(JobInterface):
     """Job implementation for simple linear model training"""
@@ -133,11 +132,7 @@ class SimpleLinearJob(JobInterface):
             'accuracy': final_accuracy,  # For compatibility with framework
             'training_time': training_time,
             'device': str(device),
-            'params': {
-                'learning_rate': self.params.learning_rate,
-                'hidden_size': self.params.hidden_size,
-                'epochs': self.params.epochs
-            }
+            'params': self.params,
         }
         
         logger.info(f"{self.get_log_prefix()} Completed: Loss={final_loss:.4f}, Time={training_time:.2f}s")
@@ -149,15 +144,7 @@ class SimpleLinearJob(JobInterface):
                 'sample': self.j + 1,
                 'device': str(device),
                 **results,
-                'params': self.params.__dict__
             })
-        
-        # Update best params if needed
-        with self.locks['best_params']:
-            if (self.shared['best_params']['loss'] is None or 
-                final_loss < self.shared['best_params']['loss']):
-                self.shared['best_params']['loss'] = final_loss
-                self.shared['best_params']['params'] = self.params
         
         return {'status': 'completed', 'stats': results}
     
@@ -206,6 +193,21 @@ class SimpleLinearJob(JobInterface):
         
         return final_loss, accuracy
 
+def save_grid_search_results(df: pd.DataFrame, path: Path):
+    """Save grid search results to YAML, with Path fields handled by custom representers"""
+    df_copy = df.copy()
+    df_copy['params'] = df_copy['params'].apply(lambda p: p.model_dump())
+    records = df_copy.to_dict(orient='records')
+    yaml.dump_all(records, path.open('a'), sort_keys=False, Dumper=yaml.Dumper)
+
+def load_grid_search_results(path: Path, convert=True) -> pd.DataFrame:
+    """Load grid search results from YAML and reconstruct Params"""
+    records = list(yaml.safe_load_all(path.open()))
+    df = pd.DataFrame(records)
+    df['params'] = df['params'].apply(lambda d: SimpleParams(**d))
+    if convert:
+        df = df.convert_dtypes()
+    return df
 
 def simple_job_factory(param_combinations):
     """Factory function to create SimpleLinearJob instances"""
@@ -277,48 +279,39 @@ def simple_parallel_grid_search(
             for i, params in enumerate(config_info['parameter_grid']):
                 f.write(f"Config {i+1}: {params}\n")
     
-    def process_results(history, best_params, output_path):
-        """Process and save results"""
-        if history:
-            # Save detailed results
-            history_df = pd.DataFrame(history)
-            results_file = output_path / 'results.csv'
-            history_df.to_csv(results_file, index=False)
-            logger.info(f"Saved {len(history)} results to {results_file}")
+    def process_results(history, output_path: Path, done: bool):
+        """Process and save results incrementally"""
+        results_file = output_path / 'results.yaml'
+        df = pd.DataFrame(history)
+        save_grid_search_results(df, results_file)
+        
+        if done and results_file.exists():
+            full_df = load_grid_search_results(results_file)
             
-            # Print summary
             print("\n=== Grid Search Results Summary ===")
-            print(f"Total jobs completed: {len(history)}")
+            print(f"Total jobs completed: {len(full_df)}")
             
-            # Group by configuration
-            config_summary = history_df.groupby('config').agg({
+            config_summary = full_df.groupby('config').agg({
                 'loss': ['mean', 'std', 'min'],
                 'accuracy': ['mean', 'std', 'max'],
                 'training_time': ['mean']
             }).round(4)
-            
             print("\nResults by configuration:")
             print(config_summary)
             
-            # Device performance comparison
-            if 'device' in history_df.columns:
-                device_summary = history_df.groupby('device').agg({
+            if 'device' in full_df.columns:
+                device_summary = full_df.groupby('device').agg({
                     'training_time': ['mean', 'count']
                 }).round(2)
-                print(f"\nDevice performance:")
+                print("\nDevice performance:")
                 print(device_summary)
-        
-        if best_params and 'params' in best_params:
-            print(f"\nBest configuration found:")
-            print(f"Loss: {best_params['loss']:.6f}")
-            print(f"Parameters: {best_params['params'].__dict__}")
         
     def cleanup():
         pass
     
     # Run the generic parallel grid search
     logger.info("Starting parallel grid search...")
-    history, best_params = generic_parallel_grid_search(
+    return generic_parallel_grid_search(
         job_factory=factory,
         total_configs=len(param_combinations),
         samples_per_config=samples_per_config,
@@ -327,10 +320,9 @@ def simple_parallel_grid_search(
         cpu_memory_per_job_gb=cpu_memory_per_job_gb,
         cpu_cores_per_job=cpu_cores_per_job,
         save_config=save_config,
-        process_results=process_results
+        process_results=process_results,
+        history_write_thresh=3,
     )
-    
-    return history, best_params
 
 
 if __name__ == "__main__":
@@ -351,19 +343,19 @@ if __name__ == "__main__":
         print(f"CUDA devices: {torch.cuda.device_count()}")
         for i in range(torch.cuda.device_count()):
             print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
-
-    # resp = input(f"Are you sure you want to delete '{SimpleParams.out_path}'? (y/N): ").strip().lower()
-    resp = 'y' # TODO remove
+    
+    p = SimpleParams()
+    resp = input(f"Are you sure you want to delete '{p.out_path}'? (y/N): ").strip().lower()
     if resp == 'y':
-        if Path(SimpleParams.out_path).exists():
-            rmtree(SimpleParams.out_path)
+        if Path(p.out_path).exists():
+            rmtree(p.out_path)
         print("Directory deleted.")
     else:
         print("Canceled.")
     
     # Run grid search
-    history, best_params = simple_parallel_grid_search(
-        output_path=SimpleParams.out_path,
+    simple_parallel_grid_search(
+        output_path=p.out_path,
         samples_per_config=2,  # Reduced for demo
         gpu_memory_per_job_gb=0.5,
         cpu_memory_per_job_gb=1.0,

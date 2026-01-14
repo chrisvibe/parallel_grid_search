@@ -64,11 +64,9 @@ class GenericJobGenerator:
 
         self.mp_manager = manager 
         self.shared = {
-            'best_params': self.mp_manager.dict({'loss': None, 'params': None}),
             'history': self.mp_manager.list(),
         }
         self.locks = {
-            'best_params': self.mp_manager.Lock(),
             'history': self.mp_manager.Lock(),
             'dataset_lock': self.mp_manager.Lock(), # in case there is data generation (write not just read)
         }
@@ -105,24 +103,26 @@ def grouped_bar_graph(values, width=32):
         avg_per_chunk = [chunk.mean() for chunk in chunks]
         return bar_graph(avg_per_chunk)
 
-
+# TODO in SLURM mode the effective cores are stuck at SLURM_CPUS_PER_TASK even if hypthread is True, fix atm is to run with priviledged and not specify so mode is SYSTEM
 class CPUJobResourceManager:
-    """Simplified CPU resource manager with SLURM support"""
+    """CPU resource manager with SLURM support and hyperthreading awareness"""
+    
     def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, 
-                 max_memory_usage=0.8, max_cpu_usage=1.0, max_jobs=None):
+                 max_memory_usage=0.8, max_cpu_usage=0.9, max_jobs=None, 
+                 allow_hyperthread=True, hyperthread_efficiency=0.9):
         self.memory_per_job_gb = memory_per_job_gb
         self.cores_per_job = cores_per_job
         self.max_memory_usage = max_memory_usage
         self.max_cpu_usage = max_cpu_usage
+        self.allow_hyperthread = allow_hyperthread
+        self.hyperthread_efficiency = hyperthread_efficiency
         
-        # Detect environment constraints
         self._detect_constraints()
         
-        # State
         self.allocated_jobs = 0
         concurrency_estimate = self._calculate_max_concurrent_processes()
-        self.target_concurrency = max(1, concurrency_estimate // 2)
-        self.max_jobs = max_jobs if max_jobs else max(1, self.available_cpus // cores_per_job)
+        self.target_concurrency = max(1, concurrency_estimate // 3)
+        self.max_jobs = max_jobs if max_jobs else max(1, self.effective_cpus // cores_per_job)
         
         self._log_initialization()
     
@@ -132,102 +132,96 @@ class CPUJobResourceManager:
         try:
             return sched_getaffinity(0)
         except (AttributeError, OSError):
-            # Not available on all systems (e.g., macOS)
             return None
-
-    @staticmethod
-    def _safe_get_core_count():
-        """Get available CPU count, return (is_slurm, cpu_count)"""
-        # CPU detection
-        if 'SLURM_CPUS_PER_TASK' in environ:
-            available_cpus = int(environ['SLURM_CPUS_PER_TASK'])
-            is_slurm = True
-        else:
-            affinity_cores = CPUJobResourceManager._get_affinity_based_cpu_cores()
-            if affinity_cores is not None:
-                available_cpus = len(affinity_cores)
-            else:
-                # Fallback to total CPU count
-                available_cpus = cpu_count() or 1
-            is_slurm = False
-        return is_slurm, available_cpus
 
     def _detect_constraints(self):
         """Detect SLURM or other environment constraints"""
-        # CPU detection
-        self.is_slurm, self.available_cpus = CPUJobResourceManager._safe_get_core_count()
+        # Physical and logical counts from system
+        self.physical_cpus = psutil.cpu_count(logical=False) or 1
+        self.logical_cpus = psutil.cpu_count(logical=True) or self.physical_cpus
+        
+        # SLURM detection - ONLY use SLURM_CPUS_PER_TASK (your actual allocation)
+        # SLURM_CPUS_ON_NODE is the node total, not your allocation
+        slurm_val = environ.get('SLURM_CPUS_PER_TASK')
+        self.slurm_cpus = int(slurm_val) if slurm_val else None
+        self.is_slurm = self.slurm_cpus is not None
+        
+        # Calculate effective CPUs (accounting for HT efficiency)
+        if self.allow_hyperthread:
+            ht_cores = max(0, self.logical_cpus - self.physical_cpus)
+            base_effective = self.physical_cpus + int(ht_cores * self.hyperthread_efficiency)
+        else:
+            base_effective = self.physical_cpus
+        
+        # If SLURM, cap to allocation
+        if self.slurm_cpus:
+            self.effective_cpus = min(self.slurm_cpus, base_effective)
+        else:
+            self.effective_cpus = base_effective
+        
+        # available_cpus for legacy compatibility (used by _get_allocated_cpu_cores)
+        self.available_cpus = self.slurm_cpus if self.slurm_cpus else self.logical_cpus
         
         # Memory detection
         if 'SLURM_MEM_PER_NODE' in environ:
-            # SLURM memory is usually in MB
             self.available_memory_gb = int(environ['SLURM_MEM_PER_NODE']) / 1024
         elif 'SLURM_MEM_PER_CPU' in environ:
-            # Memory per CPU in MB
             mem_per_cpu_mb = int(environ['SLURM_MEM_PER_CPU'])
-            self.available_memory_gb = (mem_per_cpu_mb * self.available_cpus) / 1024
+            # Use slurm allocation or physical cores (not logical - avoids double counting)
+            cpus_for_mem = self.slurm_cpus or self.physical_cpus
+            self.available_memory_gb = (mem_per_cpu_mb * cpus_for_mem) / 1024
         else:
-            # Use system memory
             self.available_memory_gb = psutil.virtual_memory().total / (1024**3)
-    
+
     def _calculate_max_concurrent_processes(self):
         """Calculate maximum concurrent jobs based on resources"""
-        # Memory-based limit
         usable_memory = self.available_memory_gb * self.max_memory_usage
         memory_limited_jobs = int(usable_memory / self.memory_per_job_gb)
         
-        # CPU-based limit
-        usable_cpus = (self.available_cpus - 1) * self.max_cpu_usage # always leave at least one
+        # Leave 1 core for system, apply max_cpu_usage factor
+        usable_cpus = max(0, (self.effective_cpus - 1) * self.max_cpu_usage)
         cpu_limited_jobs = int(usable_cpus / self.cores_per_job)
         
-        # Take the minimum and ensure at least 1
         return max(1, min(memory_limited_jobs, cpu_limited_jobs))
     
     def _log_initialization(self):
         """Log initialization details"""
         logger.info(f"CPU Resource Manager initialized:")
         logger.info(f"  Environment: {'SLURM' if self.is_slurm else 'Standard'}")
-        logger.info(f"  Available CPUs: {self.available_cpus}")
+        if self.slurm_cpus:
+            logger.info(f"  SLURM allocation: {self.slurm_cpus} CPUs")
+        logger.info(f"  Physical cores: {self.physical_cpus}")
+        logger.info(f"  Logical cores: {self.logical_cpus}")
+        logger.info(f"  Effective capacity: {self.effective_cpus} (HT efficiency: {self.hyperthread_efficiency})")
         logger.info(f"  Available Memory: {self.available_memory_gb:.1f}GB")
         logger.info(f"  Memory per job: {self.memory_per_job_gb}GB")
-        logger.info(f"  CPU cores per job: {self.cores_per_job}")
+        logger.info(f"  Cores per job: {self.cores_per_job}")
         logger.info(f"  Max concurrent jobs: {self.max_jobs}")
     
     def _get_allocated_cpu_cores(self):
         """Get the set of CPU core IDs available to this process"""
-        if self.is_slurm:
-            # In SLURM, we might have specific cores allocated
-            return set(range(self.available_cpus))
-        
-        affinity_cores = CPUJobResourceManager._get_affinity_based_cpu_cores()
+        affinity_cores = self._get_affinity_based_cpu_cores()
         if affinity_cores is not None:
             return affinity_cores
-        else:
-            return set(range(self.available_cpus))
-    
+        # Fallback: assume we can use all logical cores up to our limit
+        return set(range(self.available_cpus))
+
     def get_system_usage(self):
-        """Get current resource usage including per-core CPU"""
-        # Memory usage
+        """Get current resource usage"""
         mem = psutil.virtual_memory()
-        memory_percent = mem.percent
-        memory_available_gb = mem.available / (1024**3)
         
-        # Get per-core CPU usage for our allocated cores
         try:
             all_cpu_usage = psutil.cpu_percent(interval=0.1, percpu=True)
             available_cores = self._get_allocated_cpu_cores()
-            
-            # Filter to only our allocated cores
             cpu_per_core = [all_cpu_usage[i] for i in available_cores if i < len(all_cpu_usage)]
-            # Fixed: Handle empty list case
             cpu_percent = sum(cpu_per_core) / len(cpu_per_core) if cpu_per_core else 0
         except Exception:
-            # Fallback to simple average
             cpu_percent = psutil.cpu_percent(interval=0.1)
             cpu_per_core = None
         
         return {
-            'memory_percent': memory_percent,
-            'memory_available_gb': memory_available_gb,
+            'memory_percent': mem.percent,
+            'memory_available_gb': mem.available / (1024**3),
             'cpu_percent': cpu_percent,
             'cpu_per_core': cpu_per_core,
             'swap_percent': psutil.swap_memory().percent,
@@ -235,40 +229,25 @@ class CPUJobResourceManager:
    
     def has_available_cpu(self):
         """Check if resources are available for a new job"""
-        # First check against max concurrent limit
         if self.allocated_jobs >= self.max_jobs:
-            logger.debug(f"Too many jobs: {self.allocated_jobs}/{self.max_jobs}")
+            logger.debug(f"At max jobs: {self.allocated_jobs}/{self.max_jobs}")
             return False
         
-        # Get current usage
         usage = self.get_system_usage()
         
-        # Check memory availability
+        # Memory check
         if usage['memory_available_gb'] < self.memory_per_job_gb * 1.1:
             logger.debug(f"Insufficient memory: {usage['memory_available_gb']:.1f}GB available")
             return False
         
-        # Check if we have per-core CPU data
-        cpu_per_core = usage.get('cpu_per_core')
-        if cpu_per_core and self.available_cpus > 0:
-            # Check if at least cores_per_job of our allocated cores are idle
-            idle_cores = sum(core < 10.0 for core in cpu_per_core)  # < 10% usage = idle
-            idle_ratio = idle_cores / self.available_cpus 
-            
-            logger.debug(f"Status CPU cores - Idle cores: {idle_cores}/{self.available_cpus} ({idle_ratio:.1%}) - {grouped_bar_graph(cpu_per_core)}")
-
-            required_ratio = self.cores_per_job/self.available_cpus
-            if idle_ratio < required_ratio:
-                logger.debug(f"Not enough idle cores: {idle_ratio:.1%} < {required_ratio:.1%}")
-                return False
-        else:
-            # Fallback to average CPU usage
-            if usage['cpu_percent'] > self.max_cpu_usage * 100:
-                logger.debug(f"High CPU usage: {usage['cpu_percent']:.1f}%")
-                return False
-
+        # CPU check - simple average-based (topology-agnostic)
+        if usage['cpu_percent'] > self.max_cpu_usage * 100:
+            logger.debug(f"CPU saturated: {usage['cpu_percent']:.1f}% > {self.max_cpu_usage * 100:.0f}%")
+            return False
+        
+        # Swap pressure check
         if usage['swap_percent'] > 90:
-            logger.debug(f"High swap: {usage['swap_percent']:.1%} > 90%")
+            logger.debug(f"High swap: {usage['swap_percent']:.0f}%")
             return False
         
         return True
@@ -277,58 +256,53 @@ class CPUJobResourceManager:
         """Try to allocate resources for a job"""
         if self.has_available_cpu():
             self.allocated_jobs += 1
-            # logger.debug(f'Incremented job count {self.allocated_jobs}/{self.max_jobs}')
             return True
         return False
     
     def release(self):
         """Release resources from a completed job"""
-        self.allocated_jobs -= 1
-        # logger.debug(f'Decremented job count {self.allocated_jobs}/{self.max_jobs}')
+        self.allocated_jobs = max(0, self.allocated_jobs - 1)
     
     def handle_oom(self):
         """Handle out-of-memory error by adjusting limits"""
-        # Reduce max concurrent jobs
         old_max = self.max_jobs
         self.max_jobs = max(1, int(self.max_jobs * 0.8))
-        
-        # Increase memory estimate
         self.memory_per_job_gb *= 1.2
         
         logger.warning(f"OOM detected: reduced max jobs {old_max} -> {self.max_jobs}, "
-                          f"increased memory estimate to {self.memory_per_job_gb:.1f}GB")
+                       f"increased memory estimate to {self.memory_per_job_gb:.1f}GB")
     
     def get_status(self):
         """Get current status string"""
         usage = self.get_system_usage()
-        env_type = "SLURM" if self.is_slurm else "System"
+        env_type = "SLURM" if self.is_slurm else "SYSTEM"
         
         status = (f"{env_type}: {self.allocated_jobs}/{self.max_jobs} jobs | "
                   f"{usage['memory_available_gb']:.1f}GB free | "
                   f"{usage['memory_percent']:.0f}% mem | "
                   f"{usage['cpu_percent']:.0f}% cpu")
         
-        # Add CPU bar graph if available
-        if usage.get('cpu_per_core') and len(usage['cpu_per_core']) > 0:
+        if usage.get('cpu_per_core'):
             status += f" | cores: {grouped_bar_graph(usage['cpu_per_core'])}"
         
         return status
     
     def total_cpu_cores(self):
-        """Get total available CPU cores"""
-        return self.available_cpus
+        """Get total effective CPU capacity"""
+        return self.effective_cpus
 
     def adjust_concurrency(self):
         if self.should_decrease_concurrency():
-            self.target_concurrency -= 1
+            self.target_concurrency = max(1, self.target_concurrency - 1)
         elif self.should_increase_concurrency():
             self.target_concurrency += 1
         return self.target_concurrency
     
     def should_decrease_concurrency(self):
-        if self.target_concurrency > 1 and not self.should_increase_concurrency():
-            return True
-        return False
+        if self.target_concurrency <= 1:
+            return False
+        usage = self.get_system_usage()
+        return usage['cpu_percent'] > self.max_cpu_usage * 100
 
     def should_increase_concurrency(self):
         return self.has_available_cpu() and (self.target_concurrency < self.max_jobs)
@@ -342,7 +316,6 @@ class GPUJobResourceManager:
         
         self.gpu_allocated_jobs = {}
         self.gpu_target_concurrent = {}
-        self.last_allocated_gpu = -1
         
         self.gpu_metrics = defaultdict(lambda: {
             'memory_util': {'history': deque(maxlen=10), 'ewma': 0.0},
@@ -512,26 +485,25 @@ class GPUJobResourceManager:
         return gpu_id
     
     def _get_next_available_gpu(self, allocate=False):
-        """Round-robin GPU selection with optional allocation"""
         if not self.available_gpus:
             return None
-
-        gpu_count = len(self.available_gpus)
-        for i in range(gpu_count):
-            index = (self.last_allocated_gpu + 1 + i) % gpu_count
-            gpu_id = self.available_gpus[index]
-
+        
+        best_gpu = None
+        best_ratio = float('inf')
+        
+        for gpu_id in self.available_gpus:
             current = self.gpu_allocated_jobs[gpu_id]
             target = self.gpu_target_concurrent[gpu_id]
-
             if current < target and self._can_allocate_on_gpu(gpu_id):
-                if allocate:
-                    self.last_allocated_gpu = index
-                    self.gpu_allocated_jobs[gpu_id] += 1
-                    logger.debug(f"Allocated GPU {gpu_id} ({current + 1}/{target} jobs)")
-                return gpu_id
-
-        return None
+                ratio = current / target
+                if ratio < best_ratio:
+                    best_ratio = ratio
+                    best_gpu = gpu_id
+        
+        if best_gpu is not None and allocate:
+            self.gpu_allocated_jobs[best_gpu] += 1
+        
+        return best_gpu
 
     def release(self, gpu_id):
         """Release GPU after job completion"""
@@ -625,8 +597,6 @@ class ComputeJobResourceManager:
         self.cpu_manager = CPUJobResourceManager(
             memory_per_job_gb=cpu_memory_per_job_gb,
             cores_per_job=cpu_cores_per_job,
-            max_memory_usage=0.8,
-            max_cpu_usage=0.8
         )
         
         self.use_gpu = torch.cuda.is_available()

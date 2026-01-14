@@ -12,8 +12,16 @@ import threading
 from typing import Tuple, Callable, List, Dict, Any
 from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager, JobInterface
 import errno
-from os import waitpid, WNOHANG
+from os import waitpid, WNOHANG, environ
 import torch
+
+# prevent hpcx from affecting hpcy (shared memory)
+import tempfile
+node = environ.get("SLURMD_NODENAME") or environ.get("SLURM_NODELIST", "unknown")
+tmp_dir = Path(f'/tmp/{node}')
+tmp_dir.mkdir(exist_ok=True)
+tempfile.tempdir = str(tmp_dir)
+environ['TORCHINDUCTOR_CACHE_DIR'] = str(tmp_dir / 'torch_cache')
 
 if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method('spawn')
@@ -75,10 +83,13 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
 
         try:
             job_data = job_queue.get(timeout=0.1)
-            if job_data is None:
+            if job_data is None or job_data['job'] is None:
                 break
         except queue.Empty:
             continue
+        except KeyboardInterrupt:
+            logger.debug(f"Worker interupted with cntrl-c")
+            raise
         except Exception:
             break
         
@@ -102,6 +113,11 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
         logger.debug(f"Worker completed job {result['job'].i}-{result['job'].j} on {device}")
 
     update_stats(idle=-1)
+
+def worker_function_cpu(*args, **kwargs):
+    # hide gpu stuff, but can still access torch.compile
+    environ['CUDA_VISIBLE_DEVICES'] = ''
+    return worker_function(*args, **kwargs)
 
 def zombie_reaping():
     while True:
@@ -206,8 +222,9 @@ class LazyWorkerPool:
             
             # Only create if no idle workers
             if self.idle_workers == 0:
+                target = worker_function if self.device.type == 'cuda' else worker_function_cpu
                 p = Process(
-                    target=worker_function,
+                    target=target,
                     args=(self.worker_job_queue, self.result_queue, self.cores_per_job, 
                         self.process_priority, self.worker_stats, self.stats_lock, self.device),
                     daemon=True,
@@ -231,7 +248,7 @@ class LazyWorkerPool:
         for _ in range(min(count, self.total_workers)):
             self.worker_job_queue.put(None, timeout=1)  # Shutdown signal
             removed += 1
-        logger.info(f"{self.name}: Scaled down {removed} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
+        logger.debug(f"{self.name}: Scaled down {removed} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
         return -removed
 
     def submit_job(self, job):
@@ -255,11 +272,11 @@ class LazyWorkerPool:
                 logger.debug(f"{self.name}: Result queue Value Error")
             return None
 
-    def shutdown(self, timeout=30):
+    def shutdown(self):
         """Shutdown all workers and clean up resources"""
         logger.info(f"{self.name}: Initiating shutdown")
-        self.disable()
         self.softly_kill_all_workers()
+        sleep(1)
         self.hard_kill_all_workers()
         
         self.worker_job_queue.close()
@@ -289,11 +306,6 @@ class LazyWorkerPool:
             proc.join(timeout=1)
         
         self.workers.clear()
-        
-        # Reset worker stats
-        with self.stats_lock:
-            self.worker_stats['idle'] = 0
-            self.worker_stats['busy'] = 0
     
     def enable(self):
         self.safe_set_stat('enabled', True)
@@ -315,7 +327,7 @@ class ResourceAwareScheduler:
         
         # Worker pool
         self.worker_pools = dict()
-        pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=5)
+        pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=15)
         self.worker_pools[pool.device] = pool
         if self.resource_manager.use_gpu:
             for gpu_id in self.resource_manager.gpu_manager.available_gpus:
@@ -333,8 +345,7 @@ class ResourceAwareScheduler:
         self.scaling_threshold = 1  # jobs per scaling
         self.job_buffer = int(round(self.target_concurrency * 1/4 + 0.5))
 
-        self._start(job_generator)
-            
+        self._start_job_submissions(job_generator)
 
     @property
     def target_concurrency_split_by_resource(self):
@@ -368,7 +379,7 @@ class ResourceAwareScheduler:
     def average_completion_time(self):
         return sum(self.job_completion_times) / len(self.job_completion_times) if self.job_completion_times else self.scheduler_loop_delay
         
-    def _start(self, job_generator):
+    def _start_job_submissions(self, job_generator):
         """Start scheduler + job submission"""
         self.running = True
         self._start_job_submission(job_generator)
@@ -427,7 +438,7 @@ class ResourceAwareScheduler:
        self.stop()
        return False
 
-    def _add_job(self, job, max_queue_size=1000):
+    def _add_job(self, job, max_queue_size=100):
         while self.scheduler_job_queue.qsize() >= max_queue_size:
             if not self.running:
                 return False
@@ -526,9 +537,6 @@ class ResourceAwareScheduler:
         completed_count = self.completed_count
         jobs_completed_in_interval = completed_count - self.last_completed_count
 
-        if completed_count % 10 == 0 and completed_count > 0:
-            logger.info(f"Progress: {completed_count}/{self.total_queued_jobs} jobs completed")
-
         if jobs_completed_in_interval > 0:
             # adjust target concurrency
             self.resource_manager.adjust_target_concurrency()
@@ -540,7 +548,7 @@ class ResourceAwareScheduler:
             logger.info(self.resource_manager.gpu_manager.get_status())
         logger.info(self.resource_manager.cpu_manager.get_status())
         self.last_completed_count = completed_count
-        self.scaling_threshold = self.target_concurrency 
+        self.scaling_threshold = max(1, self.target_concurrency // 3)
 
     def _scheduler_loop(self):
         """Main scheduler loop"""
@@ -586,7 +594,7 @@ class ResourceAwareScheduler:
                         self._handle_job_completion(result)
                 zombie_reaping()
                 sleep(0.1)
-
+    
 def generic_parallel_grid_search(
     # Core parameters
     job_factory: Callable,
@@ -594,11 +602,12 @@ def generic_parallel_grid_search(
     samples_per_config: int,
     output_path: Path,
     save_config: Callable[[Path], None],
-    process_results: Callable[[List[Dict], Dict, Path], Any],
+    process_results: Callable[[List[Dict], Path, bool], Any],
     # Resource parameters
-    gpu_memory_per_job_gb: float = None,
-    cpu_memory_per_job_gb: float = None,
+    gpu_memory_per_job_gb: float = 1,
+    cpu_memory_per_job_gb: float = 1,
     cpu_cores_per_job: int = 1,
+    history_write_thresh: int = 1000,
     ) -> Tuple[List[Dict], Dict]:
     
     
@@ -617,7 +626,7 @@ def generic_parallel_grid_search(
         cpu_cores_per_job: CPU cores per job
         
     Returns:
-        Tuple of (history, best_params)
+        Path
     """
     
     # Create output directory
@@ -635,14 +644,25 @@ def generic_parallel_grid_search(
     )
 
     manager = mp.Manager()
-    history = best_params = None
 
+    def write_history(locks, shared, flush=False, tresh=history_write_thresh):
+        with locks['history']:
+            if len(shared['history']) < tresh and not flush:
+                return
+            if len(shared['history']) == 0:
+                return
+            entries = list(shared['history'])
+            shared['history'][:] = []
+        process_results(entries, output_path, flush)
+        logger.info(f"Wrote {len(entries)} results to {output_path}")
     try:
         job_generator = GenericJobGenerator(manager=manager,
                                  job_factory=job_factory,
                                  total_configs=total_configs,
                                  samples_per_config=samples_per_config,
                                  )
+        shared = job_generator.shared 
+        locks = job_generator.locks
         with ResourceAwareScheduler(resource_manager=resource_manager, manager=manager, job_generator=job_generator) as scheduler:
             start_time = time()
             with logging_redirect_tqdm():
@@ -651,23 +671,13 @@ def generic_parallel_grid_search(
                     while pbar.n < total_jobs:
                         pbar.n = scheduler.completed_count
                         pbar.refresh()
+                        write_history(locks, shared)
                         sleep(0.5)
-
-            # TODO write results as we go
-                        
-            # Extract results from shared state
-            shared = job_generator.shared 
-            locks = job_generator.locks
-            with locks.get('history', locks):
-                history = list(shared.get('history', []))
-            with locks.get('best_params', locks):
-                best_params = dict(shared.get('best_params', {}))
+            write_history(locks, shared, flush=True)
             
         # Process results with provided callback
         elapsed_time = time() - start_time
         logger.info(f"Grid search completed in {elapsed_time:.1f}s")
-        process_results(history, best_params, output_path)
-        logger.info(f"Saved {len(history)} results to {output_path}")
         
     except Exception as e:
         logger.exception(f"Unexpected error in grid search: {e}")
@@ -676,5 +686,4 @@ def generic_parallel_grid_search(
         logger.info("Shutting down shared manager")
         manager.shutdown()
 
-    return history, best_params
-                    
+    return output_path
