@@ -461,12 +461,12 @@ class ResourceAwareScheduler:
     def _calculate_spawn_delay(self):
         # Fast submission when under capacity
         utilization = self.busy_workers / max(1, self.target_concurrency)
-        
-        if utilization < 0.8:  # Under 80% capacity
-            return 0  # No delay - fill up quickly!
-        
+                
         # Only throttle when near/over capacity
         base_delay = self.average_completion_time / max(1, self.target_concurrency)
+
+        if utilization < 0.8:  # Under 80% capacity
+            return base_delay * torch.rand(()).item() # Little delay - fill up quickly!
         
         # Scale delay based on how far over capacity we are
         if utilization > 1.0:
