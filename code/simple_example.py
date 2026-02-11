@@ -209,13 +209,13 @@ def load_grid_search_results(path: Path, convert=True) -> pd.DataFrame:
         df = df.convert_dtypes()
     return df
 
-def simple_job_factory(param_combinations):
-    """Factory function to create SimpleLinearJob instances"""
-    def create_job(i, j, total_configs, total_samples, shared, locks):
-        params = param_combinations[i]
-        # Create a copy with unique seed for this sample
-        params_copy = deepcopy(params)
-        params_copy.seed = params.seed + i * 1000 + j
+class SimpleJobFactory:
+    def __init__(self, param_combinations):
+        self.param_combinations = param_combinations
+    
+    def __call__(self, i, j, total_configs, total_samples, shared, locks):
+        params = deepcopy(self.param_combinations[i])
+        params.seed = params.seed + i * 1000 + j
         
         return SimpleLinearJob(
             i=i, j=j,
@@ -223,10 +223,8 @@ def simple_job_factory(param_combinations):
             total_samples=total_samples,
             shared=shared,
             locks=locks,
-            params=params_copy
+            params=params
         )
-    return create_job
-
 
 def create_parameter_combinations():
     """Create parameter grid for demonstration"""
@@ -258,7 +256,7 @@ def simple_parallel_grid_search(
     logger.info(f"Created {len(param_combinations)} parameter combinations")
     
     # Create job factory
-    factory = simple_job_factory(param_combinations)
+    factory = SimpleJobFactory(param_combinations)
     
     # Define callbacks
     def save_config(output_path):
@@ -307,7 +305,7 @@ def simple_parallel_grid_search(
                 print(device_summary)
         
     def cleanup():
-        pass
+        logger.info("Cleaning up...")
     
     # Run the generic parallel grid search
     logger.info("Starting parallel grid search...")
@@ -321,7 +319,9 @@ def simple_parallel_grid_search(
         cpu_cores_per_job=cpu_cores_per_job,
         save_config=save_config,
         process_results=process_results,
+        cleanup=cleanup,
         history_write_thresh=3,
+        cleanup=cleanup,
     )
 
 

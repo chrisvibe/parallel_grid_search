@@ -30,39 +30,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def worker_function(job_queue, result_queue, cores_per_job, priority, worker_stats, stats_lock, device):
-    # assumption is that this function has no errors, but jobs may and are dealt with in job results outside of this function
-    def init(cores_per_job, device):
-        """Worker with proper stat tracking"""
-        set_num_interop_threads(1)
-        set_num_threads(cores_per_job)
-        p = psutil.Process()
-        
-        if device.type == 'cuda':
-            torch.cuda.set_device(device.index)
-        
+def worker_function(job_queue, result_queue, cores_per_job, priority, device):
+    """Worker function - no shared state, just queues."""
+    set_num_interop_threads(1)
+    set_num_threads(cores_per_job)
+    p = psutil.Process()
+    
+    if device.type == 'cuda':
+        torch.cuda.set_device(device.index)
+    
+    try:
+        p.nice(priority)
+    except (psutil.AccessDenied, PermissionError):
+        pass
+
+    while True:
         try:
-            p.nice(priority)
-        except (psutil.AccessDenied, PermissionError):
-            pass
-
-        update_stats(idle=1)
-        return p
-
-    def update_stats(**kwargs):
-        with stats_lock:
-            for k, v in kwargs.items():
-                worker_stats[k] += v
-
-    def get_enabled():
-        with stats_lock:
-            return worker_stats['enabled']
-
-    def set_enabled(val):
-        with stats_lock:
-            worker_stats['enabled'] = val
-
-    def run_job(job_data):
+            job_data = job_queue.get(timeout=0.1)
+            if job_data is None or job_data['job'] is None:
+                break
+        except queue.Empty:
+            continue
+        except KeyboardInterrupt:
+            logger.debug(f"Worker interrupted with ctrl-c")
+            raise
+        except Exception:
+            break
+        
         job = job_data['job']
         start_time = time()
         result = job.run(device)
@@ -73,46 +67,17 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, worker_sta
             'start_time': start_time,
             'stop_time': time(),
         })
-        return result
-    
-    p = init(cores_per_job, device)
-    while True:
-        if not get_enabled():
-            sleep(3)
-            continue
-
-        try:
-            job_data = job_queue.get(timeout=0.1)
-            if job_data is None or job_data['job'] is None:
-                break
-        except queue.Empty:
-            continue
-        except KeyboardInterrupt:
-            logger.debug(f"Worker interupted with cntrl-c")
-            raise
-        except Exception:
-            break
-        
-        update_stats(idle=-1, busy=1)
-        result = run_job(job_data)
 
         try:
             result_queue.put(result)
         except Exception:
             pass
 
-        if result.get('status') == 'error':
-            update_stats(busy=-1, idle=1, jobs_failed=1)
-            set_enabled(False)
-        else:
-            update_stats(busy=-1, idle=1, jobs_completed=1)
-
         if hasattr(result['job'], 'cleanup'):
             result['job'].cleanup()
 
         logger.debug(f"Worker completed job {result['job'].i}-{result['job'].j} on {device}")
 
-    update_stats(idle=-1)
 
 def worker_function_cpu(*args, **kwargs):
     # hide gpu stuff, but can still access torch.compile
@@ -138,9 +103,9 @@ def drain_queue(queue):
 
 
 class LazyWorkerPool:
-    """Simplified worker pool that creates workers on demand"""
+    """Worker pool with supervisor pattern - parent owns all state."""
 
-    def __init__(self, manager, max_workers, cores_per_job, process_priority=5, spawn_rate=1, device='cpu'):
+    def __init__(self, max_workers, cores_per_job, process_priority=5, spawn_rate=1, device='cpu'):
         self.device = torch.device(device)
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
@@ -150,35 +115,26 @@ class LazyWorkerPool:
         self.spawn_delay = spawn_rate 
         self.accept_jobs = True
         
-        self.mp_manager = manager 
-        self.worker_stats = self.mp_manager.dict({
-            'idle': 0,
-            'busy': 0,
-            'jobs_completed': 0,
-            'jobs_failed': 0,
-            'enabled': True,
-        })
-        self.stats_lock = self.mp_manager.Lock()
+        # Parent-owned state — no SyncManager needed
         self.workers = dict()
+        self._jobs_dispatched = 0
+        self._jobs_returned = 0
+        self._enabled = True
         
         self.name = device + '_pool'
         logger.info(f"{self.name} initialized with max_workers={max_workers}")
-
-    def safe_set_stat(self, key, value):
-        with self.stats_lock:
-            self.worker_stats[key] = value
-    
-    def safe_get_stat(self, key):
-        with self.stats_lock:
-            return self.worker_stats[key]
     
     @property
+    def alive_workers(self):
+        return sum(1 for p in self.workers.values() if p.is_alive())
+
+    @property
     def total_workers(self):
-        return self.busy_workers + self.idle_workers
+        return self.alive_workers
 
     @property
     def busy_workers(self):
-        return self.safe_get_stat('busy')
+        return max(0, self._jobs_dispatched - self._jobs_returned)
 
     @property
     def backlog(self):
@@ -186,15 +142,21 @@ class LazyWorkerPool:
 
     @property
     def idle_workers(self):
-        return self.safe_get_stat('idle')
+        return max(0, self.alive_workers - self.busy_workers)
 
     @property
     def jobs_completed(self):
-        return self.safe_get_stat('jobs_completed')
+        return self._jobs_returned
 
     @property
     def enabled(self):
-        return self.safe_get_stat('enabled')
+        return self._enabled
+
+    def enable(self):
+        self._enabled = True
+
+    def disable(self):
+        self._enabled = False
 
     def scale_workers_to(self, target_workers: int):
         """Scale to target number of workers"""
@@ -204,7 +166,7 @@ class LazyWorkerPool:
             if not process.is_alive():
                 del self.workers[pid]
 
-        current = self.total_workers
+        current = self.alive_workers
         if target_workers > current:
             return self.scale_up_workers(target_workers - current)
         elif target_workers < current:
@@ -214,19 +176,18 @@ class LazyWorkerPool:
     def scale_up_workers(self, count=1):
         """Add new workers up to max_workers limit"""
         added = 0
-        current = self.total_workers
+        current = self.alive_workers
         
         for _ in range(count):
             if current >= self.max_workers:
                 break
             
-            # Only create if no idle workers
             if self.idle_workers == 0:
                 target = worker_function if self.device.type == 'cuda' else worker_function_cpu
                 p = Process(
                     target=target,
                     args=(self.worker_job_queue, self.result_queue, self.cores_per_job, 
-                        self.process_priority, self.worker_stats, self.stats_lock, self.device),
+                        self.process_priority, self.device),
                     daemon=True,
                 )
                 p.start()
@@ -245,15 +206,17 @@ class LazyWorkerPool:
     def scale_down_workers(self, count=1):
         """Remove workers by sending shutdown signals to workers"""
         removed = 0
-        for _ in range(min(count, self.total_workers)):
+        for _ in range(min(count, self.alive_workers)):
             self.worker_job_queue.put(None, timeout=1)  # Shutdown signal
             removed += 1
-        logger.debug(f"{self.name}: Scaled down {removed} workers - {self.worker_stats} (max: {self.max_workers}, job-device backlog: {self.backlog})")
+        logger.debug(f"{self.name}: Scaled down {removed} workers (max: {self.max_workers}, job-device backlog: {self.backlog})")
         return -removed
 
     def submit_job(self, job):
-        if self.enabled or job is None:
+        if self._enabled or job is None:
             self.worker_job_queue.put({'job': job})
+            if job is not None:
+                self._jobs_dispatched += 1
             return True
         else:
             return False
@@ -262,6 +225,12 @@ class LazyWorkerPool:
         """Get a result from the result queue"""
         try:
             result = self.result_queue.get(timeout=timeout)
+            self._jobs_returned += 1
+            
+            # Handle error: disable pool if worker reported error
+            if result.get('status') == 'error' and result.get('error_type') != 'OOM':
+                self._enabled = False
+                
             return result
         except queue.Empty:
             return None
@@ -286,8 +255,8 @@ class LazyWorkerPool:
     
     def softly_kill_all_workers(self):
         drain_queue(self.worker_job_queue)
-        for _ in range(self.total_workers):
-            self.submit_job(None)
+        for _ in range(self.alive_workers):
+            self.worker_job_queue.put(None)
 
     def hard_kill_all_workers(self):
         # SIGTERM all at once
@@ -306,12 +275,7 @@ class LazyWorkerPool:
             proc.join(timeout=1)
         
         self.workers.clear()
-    
-    def enable(self):
-        self.safe_set_stat('enabled', True)
 
-    def disable(self):
-        self.safe_set_stat('enabled', False)
     
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
@@ -325,13 +289,13 @@ class ResourceAwareScheduler:
         self.scheduler_thread = None
         self.scheduler_loop_delay = scheduler_loop_delay
         
-        # Worker pool
+        # Worker pool — no manager needed
         self.worker_pools = dict()
-        pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=15)
+        pool = LazyWorkerPool(max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=15)
         self.worker_pools[pool.device] = pool
         if self.resource_manager.use_gpu:
             for gpu_id in self.resource_manager.gpu_manager.available_gpus:
-                pool = LazyWorkerPool(manager, max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=10, device=f'cuda:{gpu_id}')
+                pool = LazyWorkerPool(max_workers=self.resource_manager.max_concurrent, cores_per_job=self.resource_manager.cores_per_job, process_priority=10, device=f'cuda:{gpu_id}')
                 self.worker_pools[pool.device] = pool
         
         # Job tracking
@@ -467,7 +431,6 @@ class ResourceAwareScheduler:
 
         if utilization < 0.8:  # Under 80% capacity
             return base_delay * torch.rand(()).item() # Little delay - fill up quickly!
-        
         # Scale delay based on how far over capacity we are
         if utilization > 1.0:
             return base_delay * (2 ** (utilization - 1))
@@ -499,7 +462,7 @@ class ResourceAwareScheduler:
 
     def _handle_oom(self, device, job: JobInterface):
         pool = self.worker_pools[device]
-        pool.disable() # already disabled by worker but why not...
+        pool.disable()
         self.resource_manager.handle_oom(pool.device)
         pool.enable()
         pool.submit_job(job)
@@ -603,6 +566,7 @@ def generic_parallel_grid_search(
     output_path: Path,
     save_config: Callable[[Path], None],
     process_results: Callable[[List[Dict], Path, bool], Any],
+    cleanup: Callable = None,
     # Resource parameters
     gpu_memory_per_job_gb: float = 1,
     cpu_memory_per_job_gb: float = 1,
@@ -674,7 +638,9 @@ def generic_parallel_grid_search(
                         write_history(locks, shared)
                         sleep(0.5)
             write_history(locks, shared, flush=True)
-            
+            if cleanup is not None:
+                cleanup()
+                
         # Process results with provided callback
         elapsed_time = time() - start_time
         logger.info(f"Grid search completed in {elapsed_time:.1f}s")
@@ -685,5 +651,3 @@ def generic_parallel_grid_search(
     finally:
         logger.info("Shutting down shared manager")
         manager.shutdown()
-
-    return output_path
