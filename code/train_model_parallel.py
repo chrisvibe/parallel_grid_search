@@ -126,7 +126,7 @@ class LazyWorkerPool:
     
     @property
     def alive_workers(self):
-        return sum(1 for p in self.workers.values() if p.is_alive())
+        return sum(p.is_alive() for p in self.workers.values())
 
     @property
     def total_workers(self):
