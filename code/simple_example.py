@@ -86,9 +86,9 @@ class SimpleParams(BaseModel):
 class SimpleLinearJob(JobInterface):
     """Job implementation for simple linear model training"""
     
-    def __init__(self, i: int, j: int, total_configs: int, total_samples: int, 
-                 shared: dict, locks: dict, params: SimpleParams):
-        super().__init__(i, j, total_configs, total_samples, shared, locks)
+    def __init__(self, i: int, j: int, total_configs: int, total_samples: int,
+                 locks: dict, params: SimpleParams):
+        super().__init__(i, j, total_configs, total_samples, locks)
         self.params = params
     
     def _run(self, device):
@@ -136,17 +136,17 @@ class SimpleLinearJob(JobInterface):
         }
         
         logger.info(f"{self.get_log_prefix()} Completed: Loss={final_loss:.4f}, Time={training_time:.2f}s")
-        
-        # Update shared results (similar to BooleanReservoirJob)
-        with self.locks['history']:
-            self.shared['history'].append({
+
+        return {
+            'status': 'completed',
+            'stats': results,
+            'history': {
                 'config': self.i + 1,
                 'sample': self.j + 1,
                 'device': str(device),
                 **results,
-            })
-        
-        return {'status': 'completed', 'stats': results}
+            },
+        }
     
     def _train_model(self, model, dataset):
         """Train the model and return metrics"""
@@ -196,13 +196,14 @@ class SimpleLinearJob(JobInterface):
 def save_grid_search_results(df: pd.DataFrame, path: Path):
     """Save grid search results to YAML, with Path fields handled by custom representers"""
     df_copy = df.copy()
-    df_copy['params'] = df_copy['params'].apply(lambda p: p.model_dump())
+    df_copy['params'] = df_copy['params'].apply(lambda p: p.model_dump(mode='json'))
     records = df_copy.to_dict(orient='records')
-    yaml.dump_all(records, path.open('a'), sort_keys=False, Dumper=yaml.Dumper)
+    with path.open('a') as f:
+        yaml.dump_all(records, f, sort_keys=False, explicit_start=True, Dumper=yaml.SafeDumper)
 
 def load_grid_search_results(path: Path, convert=True) -> pd.DataFrame:
     """Load grid search results from YAML and reconstruct Params"""
-    records = list(yaml.safe_load_all(path.open()))
+    records = [r for r in yaml.safe_load_all(path.open()) if r is not None]
     df = pd.DataFrame(records)
     df['params'] = df['params'].apply(lambda d: SimpleParams(**d))
     if convert:
@@ -213,15 +214,14 @@ class SimpleJobFactory:
     def __init__(self, param_combinations):
         self.param_combinations = param_combinations
     
-    def __call__(self, i, j, total_configs, total_samples, shared, locks):
+    def __call__(self, i, j, total_configs, total_samples, locks):
         params = deepcopy(self.param_combinations[i])
         params.seed = params.seed + i * 1000 + j
-        
+
         return SimpleLinearJob(
             i=i, j=j,
             total_configs=total_configs,
             total_samples=total_samples,
-            shared=shared,
             locks=locks,
             params=params
         )
@@ -280,8 +280,9 @@ def simple_parallel_grid_search(
     def process_results(history, output_path: Path, done: bool):
         """Process and save results incrementally"""
         results_file = output_path / 'results.yaml'
-        df = pd.DataFrame(history)
-        save_grid_search_results(df, results_file)
+        if history:
+            df = pd.DataFrame(history)
+            save_grid_search_results(df, results_file)
         
         if done and results_file.exists():
             full_df = load_grid_search_results(results_file)
@@ -321,7 +322,6 @@ def simple_parallel_grid_search(
         process_results=process_results,
         cleanup=cleanup,
         history_write_thresh=3,
-        cleanup=cleanup,
     )
 
 
