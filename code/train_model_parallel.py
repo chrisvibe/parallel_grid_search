@@ -234,7 +234,7 @@ class LazyWorkerPool:
 
     def __init__(self, max_workers, cores_per_job, process_priority=5, device='cpu',
                  can_spawn_fn=None, idle_timeout: float = 120.0,
-                 spawn_delay: float = 3.0, max_scale: int = 1):
+                 spawn_delay: float = 30.0, max_scale: int = 1):
         self.device = torch.device(device)
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
@@ -253,6 +253,9 @@ class LazyWorkerPool:
         self._enabled = True
         # GPU starts at 1 (AIMD grows it); CPU starts uncapped at max_workers
         self._concurrency_limit = 1 if self.device.type == 'cuda' else max_workers
+        self._sigkill_detected = False
+        self._in_backoff = False
+        self._last_recovery_time: float = 0.0
 
         self.name = device + '_pool'
         logger.info(f"{self.name} initialized (max_workers={max_workers})")
@@ -302,7 +305,11 @@ class LazyWorkerPool:
                         sig_name = signal.Signals(-exit_code).name
                     except (ValueError, AttributeError):
                         sig_name = f"signal {-exit_code}"
-                    logger.error(f"{self.name}: Worker PID {pid} KILLED by {sig_name} (exit code {exit_code})")
+                    if exit_code == -signal.SIGKILL:
+                        logger.critical(f"{self.name}: Worker PID {pid} killed by Linux OOM killer (SIGKILL)")
+                        self._sigkill_detected = True
+                    else:
+                        logger.error(f"{self.name}: Worker PID {pid} KILLED by {sig_name} (exit code {exit_code})")
                 elif exit_code is not None and exit_code > 0:
                     logger.error(f"{self.name}: Worker PID {pid} exited with error code {exit_code}")
                 else:
@@ -376,6 +383,27 @@ class LazyWorkerPool:
         elif alive > W:
             return self._scale_down()
         return 0
+
+    def backoff(self):
+        """Shed all but one worker on a memory-pressure shock.
+
+        Resets concurrency to 1 and immediately sends sentinels to excess workers
+        (bypasses spawn_delay rate-limiting so memory is freed as fast as jobs
+        complete). Recovery is handled by _scale_pools, which increments the limit
+        by one per spawn_delay period once pressure drops.
+        """
+        if self._in_backoff:
+            return
+        self._in_backoff = True
+        prev = self._concurrency_limit
+        self._concurrency_limit = 1
+        to_shed = max(0, self.alive_workers - 1)
+        for _ in range(to_shed):
+            self.worker_job_queue.put(None)
+        now = time()
+        self._last_scale_time = now      # block rate-limited scale for one full period
+        self._last_recovery_time = now   # recovery cooldown starts now
+        logger.warning(f"{self.name}: memory pressure — backoff (limit {prev} → 1, shedding {to_shed} workers)")
 
     def submit_job(self, job):
         if self._enabled:
@@ -469,9 +497,8 @@ class ResourceAwareScheduler:
         def _make_can_spawn(device):
             return lambda pending=0: self.resource_manager.can_spawn_worker(device, pending_workers=pending)
         self.worker_pools = dict()
-        _physical_cores = self.resource_manager.cpu_manager.physical_cpus
         _logical_available = self.resource_manager.max_concurrent
-        _effective_cores = max(1, int(min(_physical_cores, _logical_available) * 0.9))
+        _effective_cores = max(1, int(_logical_available * 0.9))
         cpu_pool = LazyWorkerPool(
             max_workers=_effective_cores,
             cores_per_job=self.resource_manager.cores_per_job,
@@ -503,9 +530,9 @@ class ResourceAwareScheduler:
 
         # Dispatch cap: upper safety ceiling on total jobs in flight (queued + running).
         # in_flight includes backlog sitting in pool queues, not just active workers.
-        # Scale by pool count so each pool can hold a full max_concurrent-deep queue.
+        # Buffer = 3× total worker slots so the feeder (20ms cadence) never starves workers.
         # Worker process count is still gated independently by can_spawn_fn / max_workers.
-        self.max_in_flight = self.resource_manager.max_concurrent * len(self.worker_pools)
+        self.max_in_flight = sum(p.max_workers for p in self.worker_pools.values()) * 3
 
         self._last_status_time = 0.0
 
@@ -669,6 +696,12 @@ class ResourceAwareScheduler:
         if not self.running:
             return
 
+        # Back-pressure: when RAM is running low, let existing workers drain before
+        # enqueueing more work. Still run _scale_pools for dead-worker cleanup.
+        if self.resource_manager.is_memory_pressure_elevated():
+            self._scale_pools()
+            return
+
         pools = list(self.worker_pools.values())
         random.shuffle(pools)
 
@@ -720,12 +753,36 @@ class ResourceAwareScheduler:
 
         Sets spawn_delay from avg job time (laziness adapts to workload speed)
         then delegates all scale logic — including dead-worker cleanup — to pool.scale().
+
+        When memory pressure is elevated, calls pool.backoff() to shed workers
+        immediately. When pressure drops while a pool is in backoff, increments
+        the concurrency limit by one per spawn_delay period until fully recovered.
         """
+        pressure = self.resource_manager.is_memory_pressure_elevated()
         for pool in self.worker_pools.values():
             avg_t = self.resource_manager.bee_router._last_time.get(pool.device, None)
             if avg_t is not None:
-                pool.spawn_delay = avg_t
-            pool.scale()
+                pool.spawn_delay = max(avg_t, 30.0)
+
+            if pressure:
+                pool.backoff()
+            elif pool._in_backoff:
+                # Gradual recovery: one concurrency step per spawn_delay period.
+                # _last_scale_time is NOT updated here so _scale_up can spawn a
+                # worker immediately after each limit increment.
+                if time() - pool._last_recovery_time >= pool.spawn_delay:
+                    if pool.current_concurrency_limit < pool.max_workers:
+                        pool.current_concurrency_limit += 1
+                        pool._last_recovery_time = time()
+                        logger.info(
+                            f"{pool.name}: recovering from backoff "
+                            f"({pool.current_concurrency_limit}/{pool.max_workers})"
+                        )
+                    else:
+                        pool._in_backoff = False
+                        logger.info(f"{pool.name}: backoff recovery complete")
+
+            pool.scale()  # always: cleanup dead workers + reconcile alive → limit
 
     def _feeder_loop(self):
         """Background thread: continuously top up all pool queues."""
@@ -777,6 +834,20 @@ class ResourceAwareScheduler:
 
                 # Detect and retry jobs whose workers died without returning a result
                 self._check_lost_jobs()
+
+                for pool in self.worker_pools.values():
+                    if pool._sigkill_detected:
+                        pool._sigkill_detected = False
+                        self.resource_manager.handle_oom(pool.device)
+                        logger.critical("System OOM kill detected — tightening memory estimate, requesting shutdown")
+                        os.kill(os.getpid(), signal.SIGINT)
+                        break
+
+                if self.resource_manager.is_memory_pressure_critical():
+                    avail = self.resource_manager.cpu_manager.get_system_usage()['memory_available_gb']
+                    logger.critical(f"Memory pressure critical ({avail:.1f} GB available) — triggering graceful shutdown")
+                    os.kill(os.getpid(), signal.SIGINT)
+                    break  # stop scheduler loop; finally-block drains remaining results
 
                 # Periodic status log (every 30 s)
                 _now = time()
@@ -832,18 +903,20 @@ def generic_parallel_grid_search(
     exploration_rate: float = 0.1,
     # Retry parameters
     max_retries: int = 3,
+    cpu_only: bool = False,
     ) -> Tuple[List[Dict], Dict]:
     """Generic parallel grid search that works with any job type."""
-    
+
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=False)
     save_config(output_path)
-    
+
     resource_manager = ComputeJobResourceManager(
         cpu_memory_per_job_gb=cpu_memory_per_job_gb,
         cpu_cores_per_job=cpu_cores_per_job,
         gpu_memory_per_job_gb=gpu_memory_per_job_gb,
         exploration_rate=exploration_rate,
+        cpu_only=cpu_only,
     )
 
     history = []

@@ -244,12 +244,11 @@ class CPUJobResourceManager:
             'memory_available_gb': mem.available / (1024**3),
             'cpu_percent': cpu_percent,
             'cpu_per_core': cpu_per_core,
-            'swap_percent': psutil.swap_memory().percent,
         }
         self._usage_cache = result
         self._usage_cache_time = now
         return result
-   
+
     def has_available_cpu(self, pending_workers=0):
         """Check if real-time resources allow a new job.
 
@@ -272,12 +271,25 @@ class CPUJobResourceManager:
             logger.debug(f"CPU saturated: {usage['cpu_percent']:.1f}% > {self.max_cpu_usage * 100:.0f}%")
             return False
 
-        if usage['swap_percent'] > 90:
-            logger.debug(f"High swap: {usage['swap_percent']:.0f}%")
-            return False
-
         return True
-    
+
+    def is_memory_pressure_elevated(self) -> bool:
+        """Soft gate: pause job feeding when available RAM falls below 3× per-job estimate.
+
+        Uses psutil.virtual_memory().available, which reads /proc/meminfo. In containers
+        without cgroup v2 memory accounting this reflects host-level free RAM and may not
+        detect container-OOM pressure — but it is still far more meaningful than swap %.
+        """
+        return self.get_system_usage()['memory_available_gb'] < self.memory_per_job_gb * 3
+
+    def is_memory_pressure_critical(self) -> bool:
+        """Hard gate: trigger graceful shutdown when available RAM falls below 1.5× per-job estimate.
+
+        Fires above the spawn gate (1.1×) so the process can save partial results before
+        the OOM killer strikes. Same cgroup caveat as is_memory_pressure_elevated.
+        """
+        return self.get_system_usage()['memory_available_gb'] < self.memory_per_job_gb * 1.5
+   
     def handle_oom(self):
         """Handle out-of-memory error by tightening the memory gate"""
         self.memory_per_job_gb *= 1.2
@@ -531,13 +543,13 @@ class BeeRouter:
 
 class ComputeJobResourceManager:
     def __init__(self, cpu_memory_per_job_gb=2.0, cpu_cores_per_job=1, gpu_memory_per_job_gb=2.0,
-                 exploration_rate: float = 0.1):
+                 exploration_rate: float = 0.1, cpu_only: bool = False):
         self.cpu_manager = CPUJobResourceManager(
             memory_per_job_gb=cpu_memory_per_job_gb,
             cores_per_job=cpu_cores_per_job,
         )
 
-        self.use_gpu = torch.cuda.is_available()
+        self.use_gpu = torch.cuda.is_available() and not cpu_only
         self.gpu_manager = None
         if self.use_gpu:
             self.gpu_manager = GPUJobResourceManager(memory_per_job_gb=gpu_memory_per_job_gb)
@@ -580,6 +592,12 @@ class ComputeJobResourceManager:
             self.gpu_manager.handle_oom(gpu_id)
         else:
             self.cpu_manager.handle_oom()
+
+    def is_memory_pressure_elevated(self) -> bool:
+        return self.cpu_manager.is_memory_pressure_elevated()
+
+    def is_memory_pressure_critical(self) -> bool:
+        return self.cpu_manager.is_memory_pressure_critical()
 
     @property
     def max_concurrent(self):
