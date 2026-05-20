@@ -1,3 +1,5 @@
+import dataclasses
+import random
 import time
 import psutil
 import pynvml
@@ -8,7 +10,7 @@ import tempfile
 from collections import defaultdict, deque
 from os import environ, sched_getaffinity
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Callable, Dict, Any
 import numpy as np
 
 import logging
@@ -105,34 +107,28 @@ class JobInterface(ABC):
         return f'{self.i}-{self.j}'
 
 
-class GenericJobGenerator:
-    """Generic job generator that can create any type of job"""
-    
-    def __init__(self, job_factory, total_configs: int, samples_per_config: int):
-        """
-        job_factory: A callable that takes (i, j, total_configs, total_samples, locks) and returns a job
-        """
-        self.job_factory = job_factory
-        self.total_configs = total_configs
-        self.samples_per_config = samples_per_config
+@dataclasses.dataclass
+class JobGenerator:
+    """Iterates over the (config, sample) grid and yields jobs via job_factory."""
+    job_factory: Callable
+    total_configs: int
+    samples_per_config: int
+    locks: dict = dataclasses.field(
+        default_factory=lambda: {'dataset_lock': FileBasedLock()}
+    )
 
-        self.locks = {
-            'dataset_lock': FileBasedLock(),  # auto-releases on process death via kernel fd close
-        }
-    
+    def __len__(self) -> int:
+        return self.total_configs * self.samples_per_config
+
     def __iter__(self):
         for i in range(self.total_configs):
             for j in range(self.samples_per_config):
                 yield self.job_factory(
-                    i=i,
-                    j=j,
+                    i=i, j=j,
                     total_configs=self.total_configs,
                     total_samples=self.samples_per_config,
-                    locks=self.locks,  # FileBasedLock is picklable; no injection needed
+                    locks=self.locks,
                 )
-    
-    def __len__(self):
-        return self.total_configs * self.samples_per_config
     
 def grouped_bar_graph(values, width=32):
     """Create a compact bar graph"""
@@ -528,6 +524,19 @@ class BeeRouter:
             current = self._concurrency_limit.get(device, 1)
             if cpu_t is None or elapsed < cpu_t:
                 self._concurrency_limit[device] = current + 1       # additive increase
+
+    def rank_devices(self, devices: list, default_t: float = 60.0) -> list:
+        """Epsilon-greedy device ranking: exploit fastest device most of the time,
+        explore randomly with probability exploration_rate to avoid getting stuck
+        if a device slows down or recovers after OOM backoff.
+        """
+        if random.random() < self.exploration_rate:
+            shuffled = list(devices)
+            random.shuffle(shuffled)
+            return shuffled
+        return sorted(devices,
+                      key=lambda d: self._get_effective_weight(d, default_t),
+                      reverse=True)
 
     def _get_effective_weight(self, device: torch.device, default_t: float) -> float:
         last_t = self._last_time.get(device)

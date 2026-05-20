@@ -11,10 +11,10 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 import threading
 from typing import Tuple, Callable, List, Dict, Any
-from project.parallel_grid_search.code.parallel_utils import GenericJobGenerator, ComputeJobResourceManager, JobInterface # TODO add type hints to these
+from project.parallel_grid_search.code.parallel_utils import JobGenerator, ComputeJobResourceManager, JobInterface # TODO add type hints to these
 import errno
 import os
-from os import waitpid, WNOHANG, environ
+from os import environ
 import torch
 import signal
 import tempfile
@@ -99,13 +99,27 @@ def _cuda_health_check(device):
         return False
 
 
+def _make_error_result(job, device, pid, start_time, error_type, error_msg):
+    return {
+        'status': 'error',
+        'error_type': error_type,
+        'error': error_msg,
+        'job': job,
+        'device': device,
+        'worker_pid': pid,
+        'start_time': start_time,
+        'stop_time': time(),
+    }
+
+
 def worker_function(job_queue, result_queue, cores_per_job, priority, device,
-                    idle_timeout: float = 120.0):
+                    idle_timeout: float = 120.0, job_timeout: float = 3600.0):
     """Worker function - no shared state, just queues.
 
     Workers live until the queue is empty for idle_timeout seconds (starvation exit)
     or they receive a None sentinel (soft kill / scale-down).
     idle_timeout is the laziness knob: longer = more resistant to brief W dips.
+    job_timeout: per-job SIGALRM deadline in seconds; raises TimeoutError if exceeded.
     """
     pid = os.getpid()
     set_num_interop_threads(1)
@@ -140,10 +154,19 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, device,
         job = job_data['job']
         start_time = time()
         logger.debug(f"Worker PID {pid}: starting job {job.i}-{job.j} on {device}")
-        result_queue.put({'status': 'started', 'key': (job.i, job.j), 'pickup_time': start_time})
+        result_queue.put({'status': 'started', 'key': (job.i, job.j), 'pickup_time': start_time, 'worker_pid': pid})
+
+        def _job_timeout_handler(signum, frame):
+            raise TimeoutError(f"Job {job.i}-{job.j} exceeded job_timeout ({job_timeout:.0f}s)")
+
         try:
-            result = job.run(device)
-            job.locks = {}  # clear before pickling back through result_queue
+            old_alarm_handler = signal.signal(signal.SIGALRM, _job_timeout_handler)
+            signal.alarm(int(job_timeout))
+            try:
+                result = job.run(device)
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_alarm_handler)
             result.update({
                 'job': job,
                 'device': device,
@@ -161,33 +184,20 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, device,
                     pass
                 cuda_ok = _cuda_health_check(device)
                 logger.error(f"Worker PID {pid}: CUDA health after crash: {'OK' if cuda_ok else 'FAILED'}")
-            job.locks = {}
-            result = {
-                'status': 'error',
-                'error_type': 'worker_crash',
-                'error': f'Unhandled {type(e).__name__}: {e}',
-                'job': job,
-                'device': device,
-                'worker_pid': pid,
-                'start_time': start_time,
-                'stop_time': time(),
-            }
+            result = _make_error_result(job, device, pid, start_time,
+                                        'worker_crash', f'Unhandled {type(e).__name__}: {e}')
+        finally:
+            job.locks = {}  # always clear locks before result leaves the worker
 
         try:
             result_queue.put(result)
         except Exception as e:
             logger.error(f"Result serialization failed for job {job.i}-{job.j}: {e}")
             try:
-                result_queue.put({
-                    'status': 'error',
-                    'error_type': 'serialization',
-                    'error': f'Result serialization failed: {type(e).__name__}: {e}',
-                    'job': job,
-                    'device': device,
-                    'worker_pid': pid,
-                    'start_time': start_time,
-                    'stop_time': time(),
-                })
+                result_queue.put(
+                    _make_error_result(job, device, pid, start_time,
+                                       'serialization', f'Result serialization failed: {type(e).__name__}: {e}')
+                )
             except Exception as e2:
                 logger.critical(
                     f"Even fallback result failed for job {job.i}-{job.j}: {e2}"
@@ -203,16 +213,6 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, device,
 def worker_function_cpu(*args, **kwargs):
     environ['CUDA_VISIBLE_DEVICES'] = ''  # hide GPU, but torch.compile still works
     return worker_function(*args, **kwargs)
-
-def zombie_reaping():
-    while True:
-        try:
-            pid, _ = waitpid(-1, WNOHANG)
-            if pid == 0:
-                break
-        except OSError as e:
-            if e.errno == errno.ECHILD:
-                break
 
 def drain_queue(queue):
     while not queue.empty():
@@ -233,7 +233,7 @@ class LazyWorkerPool:
     """
 
     def __init__(self, max_workers, cores_per_job, process_priority=5, device='cpu',
-                 can_spawn_fn=None, idle_timeout: float = 120.0,
+                 can_spawn_fn=None, idle_timeout: float = 120.0, job_timeout: float = 3600.0,
                  spawn_delay: float = 30.0, max_scale: int = 1):
         self.device = torch.device(device)
         self.max_workers = max_workers
@@ -241,6 +241,7 @@ class LazyWorkerPool:
         self.process_priority = process_priority
         self.can_spawn_fn = can_spawn_fn or (lambda pending=0: True)
         self.idle_timeout = idle_timeout
+        self.job_timeout = job_timeout
         self.spawn_delay = spawn_delay  # min seconds between scale events (laziness knob)
         self.max_scale = max_scale      # max workers to spawn/kill per scale event
         self._last_scale_time: float = 0.0
@@ -324,7 +325,7 @@ class LazyWorkerPool:
         p = tmp.Process(
             target=target,
             args=(self.worker_job_queue, self.result_queue, self.cores_per_job,
-                  self.process_priority, self.device, self.idle_timeout),
+                  self.process_priority, self.device, self.idle_timeout, self.job_timeout),
             daemon=True,
         )
         p.start()
@@ -485,7 +486,7 @@ class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
 
 
-    def __init__(self, resource_manager: ComputeJobResourceManager, history: list, job_generator: GenericJobGenerator, scheduler_loop_delay: int = .1, max_retries: int = 3):
+    def __init__(self, resource_manager: ComputeJobResourceManager, history: list, job_generator: JobGenerator, scheduler_loop_delay: int = .1, max_retries: int = 3):
         self.resource_manager = resource_manager
         self.history = history
         self.running = False
@@ -520,7 +521,8 @@ class ResourceAwareScheduler:
 
         # At-least-once delivery: retry tracking
         self.job_generator = job_generator
-        self.in_flight = {}                # (i,j) -> {'time': float, 'device': torch.device}
+        self.in_flight = {}                # (i,j) -> {'queued_time', 'pickup_time', 'device', 'worker_pid'}
+        self._in_flight_lock = threading.RLock()  # guards in_flight across feeder + scheduler threads
 
         self._completed_count = 0          # jobs that completed successfully
         self.permanently_failed = set()    # (i,j) pairs that exceeded max retries
@@ -536,15 +538,19 @@ class ResourceAwareScheduler:
 
         self._last_status_time = 0.0
 
+        self._oom_recovery_deadline: float | None = None
+        self._oom_recovery_timeout: float = 120.0
+
         self._start_job_submissions(job_generator)
 
     def running_jobs_per_device(self, device):
         """Jobs actively being processed: dispatched to a pool minus jobs still in its queue."""
-        if device is None:
-            dispatched = len(self.in_flight)
-            queued = sum(pool.backlog for pool in self.worker_pools.values())
-            return max(0, dispatched - queued)
-        dispatched = sum(1 for info in self.in_flight.values() if info['device'] == device)
+        with self._in_flight_lock:
+            if device is None:
+                dispatched = len(self.in_flight)
+                queued = sum(pool.backlog for pool in self.worker_pools.values())
+                return max(0, dispatched - queued)
+            dispatched = sum(1 for info in self.in_flight.values() if info['device'] == device)
         pool = self.worker_pools.get(device)
         queued = pool.backlog if pool else 0
         return max(0, dispatched - queued)
@@ -605,7 +611,8 @@ class ResourceAwareScheduler:
         key = (job.i, job.j)
 
         # Remove from in-flight tracking (this IS the resource release)
-        self.in_flight.pop(key, None)
+        with self._in_flight_lock:
+            self.in_flight.pop(key, None)
 
         if result['status'] == 'completed':
             exec_time  = result['stop_time'] - result['start_time']
@@ -655,36 +662,66 @@ class ResourceAwareScheduler:
         )
         self._retry_queue.append(job)
 
+    def _collect_results(self, pool: 'LazyWorkerPool', timeout: float = 0.0) -> None:
+        """Drain pool's result queue and process every result."""
+        while True:
+            result = pool.get_result(timeout=timeout)
+            if result is None:
+                break
+            if result.get('status') == 'started':
+                key = result['key']
+                with self._in_flight_lock:
+                    if key in self.in_flight:
+                        self.in_flight[key]['pickup_time'] = result['pickup_time']
+                        self.in_flight[key]['worker_pid'] = result.get('worker_pid')
+            else:
+                self._handle_job_completion(result)
+
     def _check_lost_jobs(self):
         """Detect and retry jobs whose worker pool died without returning a result."""
         now = time()
 
         for device, pool in self.worker_pools.items():
             if pool.alive_workers == 0 and pool.backlog == 0:
-                # Drain the result queue before declaring jobs lost.
-                # A worker may have completed its job and pushed the result before
-                # dying. Collecting those results now removes them from in_flight,
-                # preventing duplicate dispatch of jobs that already finished.
-                while True:
-                    result = pool.get_result(timeout=0.0)
-                    if result is None:
-                        break
-                    if result.get('status') == 'started':
-                        k = result['key']
-                        if k in self.in_flight:
-                            self.in_flight[k]['pickup_time'] = result['pickup_time']
-                    else:
-                        self._handle_job_completion(result)
-
-                device_jobs = [(k, v) for k, v in list(self.in_flight.items()) if v['device'] == device]
+                # Drain before declaring jobs lost — a worker may have pushed a result
+                # just before dying.
+                self._collect_results(pool)
+                with self._in_flight_lock:
+                    device_jobs = [(k, v) for k, v in list(self.in_flight.items()) if v['device'] == device]
                 for key, info in device_jobs:
-                    self.in_flight.pop(key)
+                    with self._in_flight_lock:
+                        self.in_flight.pop(key, None)
                     age = now - info['queued_time']
                     logger.error(
                         f"Job {key[0]}-{key[1]} LOST on {device}: pool has 0 alive workers "
                         f"(job age: {age:.0f}s)"
                     )
                     self._retry_job(key, f'device pool dead ({device})')
+
+            # Detect jobs whose assigned worker died while other workers are still alive.
+            # _cleanup_dead_workers (called via pool.scale every 20ms in the feeder thread)
+            # removes dead PIDs from pool.workers promptly — alive_pids reflects current state.
+            alive_pids = set(pool.workers.keys())
+            with self._in_flight_lock:
+                orphaned = [
+                    (k, v) for k, v in list(self.in_flight.items())
+                    if v['device'] == device
+                    and v.get('worker_pid') is not None
+                    and v['worker_pid'] not in alive_pids
+                ]
+            if orphaned:
+                self._collect_results(pool)  # drain defensively before declaring jobs lost
+                for key, info in orphaned:
+                    with self._in_flight_lock:
+                        if key not in self.in_flight:
+                            continue  # completed during drain above
+                        self.in_flight.pop(key)
+                    age = now - info['queued_time']
+                    logger.error(
+                        f"Job {key[0]}-{key[1]} ORPHANED on {device}: "
+                        f"worker PID {info['worker_pid']} died (job age: {age:.0f}s)"
+                    )
+                    self._retry_job(key, f'worker died ({device})')
     
     def _feed_pools(self):
         """Kanban fill: top up every pool queue to 2 * current_concurrency_limit.
@@ -703,7 +740,13 @@ class ResourceAwareScheduler:
             return
 
         pools = list(self.worker_pools.values())
-        random.shuffle(pools)
+        devices = [p.device for p in pools]
+        known_times = [self.resource_manager.bee_router._last_time[d]
+                       for d in devices if d in self.resource_manager.bee_router._last_time]
+        default_t = max(known_times, default=60.0)
+        device_to_pool = {p.device: p for p in pools}
+        pools = [device_to_pool[d]
+                 for d in self.resource_manager.bee_router.rank_devices(devices, default_t)]
 
         # Sync AIMD limits to GPU pools before spawning decisions
         for pool in pools:
@@ -741,9 +784,10 @@ class ResourceAwareScheduler:
                 else:
                     break
                 pool.submit_job(job)
-                self.in_flight[(job.i, job.j)] = {
-                    'queued_time': time(), 'pickup_time': None, 'device': pool.device
-                }
+                with self._in_flight_lock:
+                    self.in_flight[(job.i, job.j)] = {
+                        'queued_time': time(), 'pickup_time': None, 'device': pool.device, 'worker_pid': None
+                    }
                 global_budget -= 1
 
         self._scale_pools()
@@ -807,6 +851,27 @@ class ResourceAwareScheduler:
         if self.resource_manager.gpu_manager:
             logger.info(self.resource_manager.gpu_manager.get_status())
 
+    def _enter_oom_recovery(self, reason: str, pool: 'LazyWorkerPool | None' = None) -> None:
+        """Backoff workers and wait for memory to recover instead of exiting.
+
+        Idempotent: if already in recovery, logs the repeat event and returns.
+        Recovery is monitored each scheduler loop iteration.
+        """
+        if pool is not None:
+            pool.backoff()
+        else:
+            for p in self.worker_pools.values():
+                p.backoff()
+        if self._oom_recovery_deadline is None:
+            self._oom_recovery_deadline = time() + self._oom_recovery_timeout
+            logger.critical(
+                f"{reason} — entering OOM recovery "
+                f"(backoff applied, will wait up to {self._oom_recovery_timeout:.0f}s for memory to free)"
+            )
+        else:
+            remaining = max(0.0, self._oom_recovery_deadline - time())
+            logger.warning(f"{reason} — already in OOM recovery ({remaining:.0f}s remaining)")
+
     def _scheduler_loop(self):
         """Main scheduler loop — collect results and detect lost jobs.
 
@@ -818,19 +883,8 @@ class ResourceAwareScheduler:
 
         try:
             while self.running:
-                zombie_reaping()
-
                 for pool in self.worker_pools.values():
-                    while True:
-                        result = pool.get_result(timeout=0.0)
-                        if result is None:
-                            break
-                        if result.get('status') == 'started':
-                            key = result['key']
-                            if key in self.in_flight:
-                                self.in_flight[key]['pickup_time'] = result['pickup_time']
-                        else:
-                            self._handle_job_completion(result)
+                    self._collect_results(pool)
 
                 # Detect and retry jobs whose workers died without returning a result
                 self._check_lost_jobs()
@@ -839,15 +893,24 @@ class ResourceAwareScheduler:
                     if pool._sigkill_detected:
                         pool._sigkill_detected = False
                         self.resource_manager.handle_oom(pool.device)
-                        logger.critical("System OOM kill detected — tightening memory estimate, requesting shutdown")
-                        os.kill(os.getpid(), signal.SIGINT)
-                        break
+                        self._enter_oom_recovery(f"System OOM kill detected on {pool.name}", pool)
 
                 if self.resource_manager.is_memory_pressure_critical():
                     avail = self.resource_manager.cpu_manager.get_system_usage()['memory_available_gb']
-                    logger.critical(f"Memory pressure critical ({avail:.1f} GB available) — triggering graceful shutdown")
-                    os.kill(os.getpid(), signal.SIGINT)
-                    break  # stop scheduler loop; finally-block drains remaining results
+                    self._enter_oom_recovery(f"Memory pressure critical ({avail:.1f} GB available)")
+
+                if self._oom_recovery_deadline is not None:
+                    avail = self.resource_manager.cpu_manager.get_system_usage()['memory_available_gb']
+                    if not self.resource_manager.is_memory_pressure_elevated():
+                        logger.info(f"OOM recovery complete — {avail:.1f} GB available, resuming job submission")
+                        self._oom_recovery_deadline = None
+                    elif time() > self._oom_recovery_deadline:
+                        logger.critical(
+                            f"OOM recovery timed out after {self._oom_recovery_timeout:.0f}s "
+                            f"— memory still critical ({avail:.1f} GB available), requesting shutdown"
+                        )
+                        os.kill(os.getpid(), signal.SIGINT)
+                        break
 
                 # Periodic status log (every 30 s)
                 _now = time()
@@ -869,20 +932,19 @@ class ResourceAwareScheduler:
             drain_deadline = time() + 30
             while self.in_flight and time() < drain_deadline:
                 for pool in self.worker_pools.values():
-                    result = pool.get_result(timeout=1.0)
-                    if result is not None:
-                        self._handle_job_completion(result)
+                    self._collect_results(pool, timeout=1.0)
                 self._check_lost_jobs()
-                zombie_reaping()
                 sleep(0.1)
 
             if self.in_flight:
+                with self._in_flight_lock:
+                    stuck = list(self.in_flight.keys())
                 logger.warning(
-                    f"Drain timeout: {len(self.in_flight)} jobs still in flight: "
-                    f"{list(self.in_flight.keys())[:10]}"
+                    f"Drain timeout: {len(stuck)} jobs still in flight: {stuck[:10]}"
                 )
-                for key in list(self.in_flight.keys()):
-                    self.in_flight.pop(key)
+                for key in stuck:
+                    with self._in_flight_lock:
+                        self.in_flight.pop(key, None)
                     self._retry_job(key, 'drain timeout')
     
 def generic_parallel_grid_search(
@@ -940,7 +1002,7 @@ def generic_parallel_grid_search(
     prev_sigterm = signal.signal(signal.SIGTERM, _on_signal)
     prev_sigint = signal.signal(signal.SIGINT, _on_signal)
     try:
-        job_generator = GenericJobGenerator(
+        job_generator = JobGenerator(
             job_factory=job_factory,
             total_configs=total_configs,
             samples_per_config=samples_per_config,
