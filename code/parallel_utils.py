@@ -1,14 +1,37 @@
+import contextlib
 import dataclasses
 import random
+import sqlite3
+import threading
 import time
+
+import logging as _logging
+_db_logger = _logging.getLogger(__name__)
+
+def _db_retry(fn, max_retries: int = 10, base_wait: float = 0.5):
+    """Call fn() and retry on sqlite3.OperationalError with exponential back-off.
+
+    Covers transient NFS lock contention that exceeds SQLite's built-in
+    busy_timeout.  Total wait budget ≈ sum(k*base_wait for k in 1..max_retries)
+    ≈ 27 s with defaults — enough for 5-node concurrent parquet flushes.
+    """
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError:
+            if attempt == max_retries - 1:
+                raise
+            wait = (attempt + 1) * base_wait + random.random()
+            _db_logger.warning(
+                f"DB locked (attempt {attempt + 1}/{max_retries}), retrying in {wait:.1f}s"
+            )
+            time.sleep(wait)
 import psutil
 import pynvml
 import torch
-import fcntl
-import os
-import tempfile
 from collections import defaultdict, deque
 from os import environ, sched_getaffinity
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Any
 import numpy as np
@@ -16,56 +39,252 @@ import numpy as np
 import logging
 logger = logging.getLogger(__name__)
 
+DATASET_LOCK_KEY = 'dataset_lock'
 
-class FileBasedLock:
-    """Advisory file lock using fcntl.flock().
+@dataclasses.dataclass(frozen=True)
+class RunLayout:
+    """File and directory names for a grid search output directory.
 
-    Unlike mp.Lock (POSIX semaphore), the kernel automatically releases
-    this lock when the owning process dies (because the fd is closed).
+    All paths are relative to the run root (output_path).  The data sub-directory
+    holds per-batch Parquets, state.db, and the compacted result file.
 
-    Picklable: stores only the path. Each process opens its own fd in
-    acquire(), which is what spawn-mode workers need.
+    Usage::
+
+        data_dir   = output_path / RUN.data_dir
+        state_path = data_dir / RUN.state_db
+        compacted  = data_dir / RUN.compacted_file
+        flag       = output_path / RUN.completed_flag
+    """
+    data_dir:       str = 'data'                        # folder holding batch Parquets + state.db
+    compacted_file: str = 'data.parquet'                # merged results written at completion
+    state_db:       str = 'state.db'                    # ephemeral SQLite job-queue; all SQLiteLocks share this file
+    building_lock:  str = 'state.building.lock'         # file-based init lock (used before state.db exists)
+    completed_flag: str = 'GRID_SEARCH_COMPLETED.flag'  # plain file written when all jobs done; not a lock
+
+RUN = RunLayout()
+
+# Legacy constants — kept so old run directories can still be read
+LOG_DB          = 'log.db'
+
+
+class SQLiteLock:
+    """Advisory mutex backed by SQLite BEGIN IMMEDIATE.
+
+    Drop-in replacement for the former fcntl-based FileBasedLock.  Points to
+    the grid-search log.db, removing the need for a separate lock file and
+    the fcntl dependency.  Works across all processes on this node and across
+    nodes sharing the same NFS/Lustre path.
+
+    Picklable (stores only path) — each worker process unpickles its own
+    instance and opens a fresh connection on acquire(), which is what
+    spawn-mode workers need.
     """
 
-    def __init__(self, path=None):
-        if path is None:
-            tmp = tempfile.gettempdir()
-            path = os.path.join(tmp, 'dataset_creation.lock')
-        self._path = path
-        open(self._path, 'a').close()
-        self._fd = None
+    def __init__(self, db_path: Path, timeout_ms: int = 30_000):
+        self._path = str(db_path)
+        self._timeout_ms = timeout_ms
+        self._conn = None
 
-    def acquire(self, blocking=True):
-        self._fd = open(self._path, 'r')
-        op = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+    def acquire(self):
+        def _try():
+            conn = sqlite3.connect(self._path, timeout=self._timeout_ms / 1000,
+                                   isolation_level=None)
+            conn.execute(f"PRAGMA busy_timeout={self._timeout_ms}")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                conn.close()
+                raise
+            self._conn = conn
+        _db_retry(_try, max_retries=5, base_wait=2.0)
+
+    def try_acquire(self, timeout: float = 0.0) -> bool:
+        """Non-blocking acquire attempt. Returns True if lock obtained, False if busy."""
         try:
-            fcntl.flock(self._fd.fileno(), op)
+            conn = sqlite3.connect(self._path, timeout=timeout, isolation_level=None)
+            conn.execute(f"PRAGMA busy_timeout={max(int(timeout * 1000), 0)}")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                conn.close()
+                return False
+            self._conn = conn
             return True
-        except BlockingIOError:
-            self._fd.close()
-            self._fd = None
+        except sqlite3.OperationalError:
             return False
 
     def release(self):
-        if self._fd is not None:
-            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
-            self._fd.close()
-            self._fd = None
+        if self._conn is not None:
+            self._conn.execute("COMMIT")
+            self._conn.close()
+            self._conn = None
 
     def __enter__(self):
         self.acquire()
         return self
 
-    def __exit__(self, *exc):
-        self.release()
+    def __exit__(self, exc_type, *_):
+        if self._conn is not None:
+            try:
+                self._conn.execute("ROLLBACK" if exc_type else "COMMIT")
+            finally:
+                self._conn.close()
+                self._conn = None
         return False
 
     def __getstate__(self):
-        return {'_path': self._path}
+        return {'_path': self._path, '_timeout_ms': self._timeout_ms}
 
     def __setstate__(self, state):
         self._path = state['_path']
-        self._fd = None
+        self._timeout_ms = state.get('_timeout_ms', 30_000)
+        self._conn = None
+
+
+class GridSearchDB:
+    """SQLite-backed job tracker — single source of truth for job state across nodes.
+
+    WAL mode allows concurrent reads from multiple processes with serialised writes,
+    which is safe on Lustre and modern NFS.
+    """
+
+    _SCHEMA = """
+        CREATE TABLE IF NOT EXISTS jobs (
+            i      INTEGER NOT NULL,
+            j      INTEGER NOT NULL,
+            status TEXT    NOT NULL DEFAULT 'pending',
+            PRIMARY KEY (i, j)
+        );
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+        self._lock = threading.Lock()  # serialize cross-thread access to _conn
+        # WAL mode is NOT used: SQLite's WAL relies on the -shm shared-memory file
+        # which does not propagate reliably over NFS/Lustre.  DELETE mode (the default)
+        # uses fcntl byte-range locks, which Lustre supports correctly.
+        # Retry loop handles the NFS race where a second node opens the file while
+        # the first is still writing the schema.
+        for attempt in range(30):
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=60, check_same_thread=False,
+                                       isolation_level=None)
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.executescript(self._SCHEMA)  # executescript auto-commits
+                self._conn = conn
+                break
+            except sqlite3.DatabaseError as e:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                msg = str(e).lower()
+                file_size = Path(db_path).stat().st_size if Path(db_path).exists() else 0
+                # Empty/absent file = NFS creation race (other node still writing schema).
+                # Non-empty file with DB error = corrupted by mid-write kill → delete.
+                is_race = file_size == 0 and 'not a database' in msg
+                is_corrupt = 'malformed' in msg or ('not a database' in msg and file_size > 0)
+                if is_race and attempt < 29:
+                    wait = 1.0 + random.random()
+                    logger.warning(f"DB not ready yet (attempt {attempt+1}/30), retrying in {wait:.1f}s: {e}")
+                    time.sleep(wait)
+                elif is_corrupt:
+                    logger.warning(
+                        f"log.db corrupted (killed mid-write?) — deleting and recreating "
+                        f"(recover_results will reconstruct from parquet): {e}"
+                    )
+                    for suffix in ('', '-journal', '-wal', '-shm'):
+                        Path(str(db_path) + suffix).unlink(missing_ok=True)
+                    # fall through to next attempt; generic_parallel_grid_search will call recover_results
+                else:
+                    raise
+
+    @contextlib.contextmanager
+    def _tx(self):
+        """Thread-safe explicit transaction on the shared _conn.
+
+        Acquires the instance lock, issues BEGIN, yields the connection,
+        then COMMITs or ROLLBACKs.  Replaces `with self._conn:` to avoid the
+        CPython bug (SystemError: error return without exception set) that
+        surfaces when the connection is shared across threads.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def init_jobs(self, total_configs: int, samples_per_config: int) -> None:
+        """Idempotent: insert all (i,j) pairs as pending if not already present.
+
+        Fast-path: if the job count already matches, skip the bulk INSERT entirely.
+        This prevents the second node in a multi-node run from doing 290k no-op inserts.
+        """
+        expected = total_configs * samples_per_config
+        existing = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        if existing >= expected:
+            return
+        with self._tx() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO jobs (i, j, status) VALUES (?, ?, 'pending')",
+                [(i, j)
+                 for i in range(total_configs)
+                 for j in range(samples_per_config)],
+            )
+
+    def claim_next_batch(self, batch_size: int) -> list:
+        """Atomically claim up to batch_size pending jobs in one transaction.
+
+        Marks claimed jobs as 'done' immediately — data.db PRIMARY KEY is the true
+        uniqueness guarantee, so we don't need a timed lease.  On crash recovery,
+        _sync_jobs_with_data resets any 'done' rows absent from data.db back to
+        'pending' so they get re-run.
+
+        Returns a list of (i, j) tuples, possibly shorter than batch_size if few remain.
+        """
+        with self._tx() as conn:
+            rows = conn.execute(
+                "UPDATE jobs SET status='done' "
+                "WHERE rowid IN (SELECT rowid FROM jobs WHERE status='pending' LIMIT ?) "
+                "RETURNING i, j",
+                (batch_size,),
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def mark_done_batch(self, pairs: list) -> None:
+        """Mark many jobs done in a single transaction — use during recovery to avoid NFS lock storms."""
+        with self._tx() as conn:
+            conn.executemany(
+                "UPDATE jobs SET status='done' WHERE i=? AND j=?",
+                [(i, j) for i, j in pairs],
+            )
+
+    def counts(self) -> dict:
+        """Return {status: count} for all statuses present in the DB."""
+        def _read():
+            with self._lock:
+                return dict(self._conn.execute(
+                    "SELECT status, COUNT(*) FROM jobs GROUP BY status"
+                ).fetchall())
+        return _db_retry(_read)
+
+    @classmethod
+    def open(cls, path: Path, total_configs: int, samples_per_config: int) -> 'GridSearchDB':
+        """Open (or create) the DB and initialise jobs.
+
+        Crash recovery (resetting claimed-but-lost jobs back to pending) is handled
+        by _sync_jobs_with_data in generic_parallel_grid_search, which compares
+        jobs.db against data.db after open() returns.
+        """
+        db = cls(path)
+        db.init_jobs(total_configs, samples_per_config)
+        return db
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 class JobInterface(ABC):
@@ -109,51 +328,156 @@ class JobInterface(ABC):
 
 @dataclasses.dataclass
 class JobGenerator:
-    """Iterates over the (config, sample) grid and yields jobs via job_factory."""
+    """Iterates over the (config, sample) grid and yields jobs via job_factory.
+
+    When db is None: sequential iteration over all (i,j) pairs (single-node mode).
+    When db is set: jobs are claimed atomically from the DB (multi-node mode).
+    Claiming immediately marks jobs 'done' — data.db PRIMARY KEY is the dedup guarantee.
+    """
     job_factory: Callable
     total_configs: int
     samples_per_config: int
-    locks: dict = dataclasses.field(
-        default_factory=lambda: {'dataset_lock': FileBasedLock()}
-    )
+    db: 'GridSearchDB | None' = None
+    locks: dict = dataclasses.field(default_factory=dict)
 
     def __len__(self) -> int:
         return self.total_configs * self.samples_per_config
 
     def __iter__(self):
-        for i in range(self.total_configs):
-            for j in range(self.samples_per_config):
+        if self.db is not None:
+            # Batch-claim jobs to amortize NFS SQLite lock acquisitions.
+            # Without batching, filling a 96-job queue costs 96 round-trips;
+            # with batch_size=32 it costs 3.
+            _BATCH = ResourceLimits.db_claim_batch_size
+            buffer: deque = deque()
+            while True:
+                if not buffer:
+                    try:
+                        batch = self.db.claim_next_batch(_BATCH)
+                    except sqlite3.OperationalError as e:
+                        # DB locked on NFS — brief sleep and retry WITHOUT propagating out
+                        # of the generator (a propagated exception closes the generator,
+                        # causing the next next() to raise StopIteration and falsely set
+                        # submission_complete=True). Keep the sleep short so the feeder
+                        # thread isn't blocked long enough to miss recovery steps.
+                        logger.warning(f"DB locked in JobGenerator, retrying: {e}")
+                        time.sleep(0.5 + random.random() * 0.5)
+                        continue
+                    if not batch:
+                        return
+                    buffer.extend(batch)
+                i, j = buffer.popleft()
                 yield self.job_factory(
                     i=i, j=j,
                     total_configs=self.total_configs,
                     total_samples=self.samples_per_config,
                     locks=self.locks,
                 )
+        else:
+            for i in range(self.total_configs):
+                for j in range(self.samples_per_config):
+                    yield self.job_factory(
+                        i=i, j=j,
+                        total_configs=self.total_configs,
+                        total_samples=self.samples_per_config,
+                        locks=self.locks,
+                    )
     
+@dataclasses.dataclass
+class ResourceLimits:
+    """Centralized thresholds for all resource-management decisions.
+
+    Control hierarchy (softest → hardest):
+
+    Mechanism        Signal                   Trigger                          Action
+    ───────────────  ───────────────────────  ───────────────────────────────  ──────────────────────────────
+    Budget ceiling   Estimated RSS            > mem_target_fraction            Cap target worker count
+    Spawn gate       Projected RSS            > mem_target_fraction            Block this spawn only
+    Elevated gate    Actual job RSS           > mem_elevated_fraction          Pause feeding + backoff (halve limit)
+    Critical gate    Machine RAM %            > mem_critical_machine_fraction  Backoff (halve limit)
+                     SLURM actual RSS         > mem_critical_alloc_fraction    Backoff (halve limit)
+
+    Asymmetric scaling:
+      Scale down — immediate: backoff() halves limit + sends sentinels at once
+      Scale up   — slow: +1 per recovery_period_s after backoff clears;
+                         +1 per grow_delay_factor × recovery_period_s for budget-ceiling growth
+
+    Hysteresis:
+      Elevated gate: enter at mem_elevated_fraction, exit at mem_elevated_exit_fraction
+      GPU compute:   enter saturation at gpu_compute_hi, exit at gpu_compute_lo
+    """
+    # Proactive concurrency ceiling — cap workers so ESTIMATED total RSS ≤ this.
+    # Uses EWMA estimates, so may briefly overshoot; elevated gate catches the excess.
+    mem_target_fraction: float = 0.87
+
+    # Elevated gate (soft emergency: pause feeding + backoff).
+    # Applies to available_memory_gb (SLURM alloc if Slurm, machine RAM otherwise).
+    # Defaults to mem_target_fraction + 0.03 so the spawn gate fires first (stop adding
+    # workers), then if RSS keeps climbing and hits elevated, workers are shed.
+    mem_elevated_fraction: float | None = None   # default: mem_target_fraction + 0.03 (see __post_init__)
+    # Exit threshold is well below entry to avoid rapid oscillation near the boundary.
+    # Gap of ~9pp on a 32 GB machine ≈ 2.8 GB — enough to absorb one worker's variance.
+    mem_elevated_exit_fraction: float = 0.78     # exit (hysteresis lower bound)
+
+    # Critical gates (hard emergency: backoff + shed workers immediately)
+    mem_critical_machine_fraction: float = 0.92  # machine-wide (all users, any env)
+    mem_critical_alloc_fraction: float = 0.99    # our job's RSS vs SLURM alloc (Slurm only)
+
+    # CPU spawn gate — blocks new worker spawns when CPU is fully saturated.
+    # Higher than the memory target: high CPU means workers are running (desired),
+    # so only block near 100% where a new spawn would cause context-switch overhead.
+    cpu_max_usage: float = 0.92
+
+    # EWMA smoothing (α = weight of newest sample)
+    cpu_ewma_alpha: float = 0.05          # slow: downward decay (observed < estimate — conservative)
+    cpu_ewma_alpha_up: float = 0.30       # fast: upward adapt (observed > estimate — protect against OOM)
+    cpu_ewma_startup_alpha: float = 0.30  # fast: first N samples converge quickly (matches GPU alpha)
+    cpu_ewma_startup_n: int = 10          # switch from startup→steady alpha after this many samples
+    gpu_ewma_alpha: float = 0.30  # fast: responds to rapid GPU utilisation changes
+
+    # GPU thresholds
+    gpu_memory_util_max: float = 0.85
+    gpu_compute_lo: float = 0.85  # hysteresis lower bound — wider band prevents thrashing
+    gpu_compute_hi: float = 0.95  # hysteresis upper bound (saturate at or above this)
+
+    # Scaling timing
+    recovery_period_s: float = 30.0  # fixed interval between each +1 concurrency step during backoff recovery
+    grow_delay_factor: float = 4.0   # budget-ceiling growth X× slower than recovery (120 s/step)
+
+    # Infrastructure
+    db_claim_batch_size: int = 128
+    mem_cache_ttl_s: float = 0.5
+    mem_estimate_update_interval_s: float = 5.0
+    min_alive_for_estimate: int = 2
+    startup_rss_min_fraction: float = 0.5  # skip EWMA updates below init_estimate × this
+    min_memory_per_job_gb: float = 0.5     # floor for EWMA memory estimate
+
+    def __post_init__(self):
+        if self.mem_elevated_fraction is None:
+            self.mem_elevated_fraction = self.mem_target_fraction + 0.03
+
+
 def grouped_bar_graph(values, width=32):
-    """Create a compact bar graph"""
-    def bar_graph(values):
-        # Unicode blocks for 8 levels
+    """Compact unicode bar graph — used by CPUJobResourceManager.get_status()."""
+    def bar_graph(vals):
         bars = "▁▂▃▄▅▆▇█"
-        return ''.join(bars[min(int(p / 100 * (len(bars) - 1)), len(bars) - 1)] for p in values)
+        return ''.join(bars[min(int(p / 100 * (len(bars) - 1)), len(bars) - 1)] for p in vals)
 
     values = np.array(values)
-    n = len(values)
-    if n <= width:
+    if len(values) <= width:
         return bar_graph(values)
-    else:
-        # Average values over chunks
-        chunks = np.array_split(values, width)
-        avg_per_chunk = [chunk.mean() for chunk in chunks]
-        return bar_graph(avg_per_chunk)
+    chunks = np.array_split(values, width)
+    return bar_graph([c.mean() for c in chunks])
+
 
 class CPUJobResourceManager:
     """CPU resource manager with SLURM support"""
 
-    def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, max_cpu_usage=0.9):
+    def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, limits=None):
+        self.limits = limits or ResourceLimits()
         self.memory_per_job_gb = memory_per_job_gb
+        self._initial_memory_per_job_gb = memory_per_job_gb
         self.cores_per_job = cores_per_job
-        self.max_cpu_usage = max_cpu_usage
 
         self._detect_constraints()
         self._log_initialization()
@@ -161,7 +485,16 @@ class CPUJobResourceManager:
         psutil.cpu_percent(interval=None, percpu=True)  # prime non-blocking counter
         self._usage_cache: dict = {}
         self._usage_cache_time: float = 0.0
-        self._cache_ttl: float = 0.5
+        self._cache_ttl: float = self.limits.mem_cache_ttl_s
+
+        # All memory-tracking state initialised here — no hasattr guards needed in methods
+        self._last_mem_check_time: float = 0.0
+        self._cached_job_mem_gb: float = 0.0
+        self._last_total_rss_gb: float = 0.0
+        self._obs_last_update: float = 0.0
+        self._obs_mem_ewma: float | None = None
+        self._obs_n_samples: int = 0       # counts EWMA updates; startup alpha used until >= cpu_ewma_startup_n
+        self._in_elevated_state: bool = False
 
     @staticmethod
     def _get_affinity_based_cpu_cores():
@@ -249,66 +582,188 @@ class CPUJobResourceManager:
         """Check if real-time resources allow a new job.
 
         pending_workers: number of workers spawned in the current batch that have
-        not yet been measured by the OS.  Their estimated memory is subtracted from
-        the reported available total before applying the threshold check, preventing
-        over-spawning within a single _try_scale_up call.
+        not yet been measured by the OS.  Their estimated memory is accounted for
+        as if already resident, preventing over-spawning within a single batch.
+
+        Memory gate uses RSS budget: total child RSS + (pending+1) × estimate must
+        fit within 80% of the SLURM allocation.  psutil.available is NOT used here
+        because it includes reclaimable page cache and routinely shows 47GB "free"
+        at 83% physical usage, making the gate fire far too late.
         """
         usage = self.get_system_usage()
 
-        effective_available = usage['memory_available_gb'] - pending_workers * self.memory_per_job_gb
-        if effective_available < self.memory_per_job_gb * 1.1:
+        budget_gb = self.available_memory_gb * self.limits.mem_target_fraction
+        total_rss = self._last_total_rss_gb
+        projected = total_rss + (pending_workers + 1) * self.memory_per_job_gb
+        if projected > budget_gb:
             logger.debug(
-                f"Insufficient memory: {effective_available:.1f}GB effective "
-                f"({usage['memory_available_gb']:.1f}GB free, {pending_workers} pending)"
+                f"RSS budget exceeded: {projected:.1f}GB projected "
+                f"({total_rss:.1f}GB rss + {pending_workers+1} × {self.memory_per_job_gb:.2f}GB) "
+                f"vs {budget_gb:.0f}GB budget"
             )
             return False
 
-        if usage['cpu_percent'] > self.max_cpu_usage * 100:
-            logger.debug(f"CPU saturated: {usage['cpu_percent']:.1f}% > {self.max_cpu_usage * 100:.0f}%")
+        # For non-SLURM: also gate on actual free memory.  The RSS projection above
+        # uses the EWMA estimate, which can lag by 30-60 s during startup when workers
+        # load large datasets.  This catches that window: require free memory to cover
+        # one more worker's estimate PLUS the safety headroom before spawning.
+        if not self.is_slurm:
+            _free_gb = psutil.virtual_memory().available / (1024**3)
+            _headroom_gb = self.available_memory_gb * (1 - self.limits.mem_target_fraction)
+            if _free_gb < self.memory_per_job_gb + _headroom_gb:
+                logger.debug(
+                    f"Free memory floor: {_free_gb:.1f}GB free, need "
+                    f"{self.memory_per_job_gb:.1f}GB (estimate) + {_headroom_gb:.1f}GB (headroom)"
+                )
+                return False
+
+        if usage['cpu_percent'] > self.limits.cpu_max_usage * 100:
+            logger.debug(f"CPU saturated: {usage['cpu_percent']:.1f}% > {self.limits.cpu_max_usage * 100:.0f}%")
             return False
 
         return True
 
-    def is_memory_pressure_elevated(self) -> bool:
-        """Soft gate: pause job feeding when available RAM falls below 3× per-job estimate.
+    def get_actual_job_memory_gb(self) -> float:
+        """Return RSS of this process + all children (throttled to mem_estimate_update_interval_s)."""
+        now = time.time()
+        if (now - self._last_mem_check_time) > self.limits.mem_estimate_update_interval_s:
+            try:
+                proc = psutil.Process()
+                total_rss = proc.memory_info().rss
+                for child in proc.children(recursive=True):
+                    try:
+                        total_rss += child.memory_info().rss
+                    except psutil.NoSuchProcess:
+                        pass
+                self._cached_job_mem_gb = total_rss / (1024 ** 3)
+                self._last_mem_check_time = now
+            except Exception:
+                pass  # keep previous cached value
+        return self._cached_job_mem_gb
 
-        Uses psutil.virtual_memory().available, which reads /proc/meminfo. In containers
-        without cgroup v2 memory accounting this reflects host-level free RAM and may not
-        detect container-OOM pressure — but it is still far more meaningful than swap %.
+    def is_memory_pressure_elevated(self) -> bool:
+        """Soft gate with hysteresis: pause feeding + backoff.
+
+        Enters elevated when actual job RSS exceeds mem_elevated_fraction of allocation;
+        exits only after RSS drops to mem_elevated_exit_fraction — prevents rapid
+        oscillation when memory hovers near the boundary.
         """
-        return self.get_system_usage()['memory_available_gb'] < self.memory_per_job_gb * 3
+        job_rss_gb = self.get_actual_job_memory_gb()
+        alloc = self.available_memory_gb
+        if self._in_elevated_state:
+            self._in_elevated_state = job_rss_gb > alloc * self.limits.mem_elevated_exit_fraction
+        else:
+            self._in_elevated_state = job_rss_gb > alloc * self.limits.mem_elevated_fraction
+        return self._in_elevated_state
 
     def is_memory_pressure_critical(self) -> bool:
-        """Hard gate: trigger graceful shutdown when available RAM falls below 1.5× per-job estimate.
+        """Hard emergency brake: OOM recovery if machine OR Slurm allocation is critical."""
+        if psutil.virtual_memory().percent > self.limits.mem_critical_machine_fraction * 100:
+            return True
+        if self.is_slurm:
+            if self.get_actual_job_memory_gb() > self.available_memory_gb * self.limits.mem_critical_alloc_fraction:
+                return True
+        return False
 
-        Fires above the spawn gate (1.1×) so the process can save partial results before
-        the OOM killer strikes. Same cgroup caveat as is_memory_pressure_elevated.
+    def update_memory_estimate(self, alive_workers: int) -> None:
+        """EWMA-update memory_per_job_gb from live child-process RSS measurements.
+
+        Throttled to mem_estimate_update_interval_s; requires min_alive_for_estimate
+        workers to avoid noisy readings during ramp-up.  Alpha is intentionally low
+        (0.05) to track sustained shifts (lighter job family mid-run) without reacting
+        to transient dips (workers idle between jobs).  Bidirectional so the spawn gate
+        self-calibrates throughout the grid search.
         """
-        return self.get_system_usage()['memory_available_gb'] < self.memory_per_job_gb * 1.5
-   
+        if alive_workers == 0:
+            # All workers dead — reset stale total so the spawn gate isn't blocked by
+            # the peak RSS of the previous worker cohort.
+            self._last_total_rss_gb = 0.0
+            return
+        if alive_workers < self.limits.min_alive_for_estimate:
+            return
+        _now = time.time()
+        if _now - self._obs_last_update < self.limits.mem_estimate_update_interval_s:
+            return
+        self._obs_last_update = _now
+
+        worker_rss_bytes = 0
+        try:
+            proc = psutil.Process()
+            for child in proc.children(recursive=True):
+                try:
+                    worker_rss_bytes += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            return
+        if worker_rss_bytes <= 0:
+            return
+        self._last_total_rss_gb = worker_rss_bytes / (1024**3)
+        observed = self._last_total_rss_gb / alive_workers
+        # Skip early-startup readings — a tiny observed value poisons the EWMA downward,
+        # causing the spawn gate to allow far more workers than are safe.
+        if observed < self._initial_memory_per_job_gb * self.limits.startup_rss_min_fraction:
+            return
+        if self._obs_mem_ewma is None:
+            self._obs_mem_ewma = observed
+        else:
+            # Asymmetric EWMA: adapt fast when observed > estimate (OOM risk), slow
+            # when observed < estimate (conservative — don't shed workers on a transient dip).
+            # Startup phase uses the fast alpha in both directions until the estimate converges.
+            if self._obs_n_samples < self.limits.cpu_ewma_startup_n:
+                α = self.limits.cpu_ewma_startup_alpha
+            elif observed > self._obs_mem_ewma:
+                α = self.limits.cpu_ewma_alpha_up
+            else:
+                α = self.limits.cpu_ewma_alpha
+            self._obs_mem_ewma = α * observed + (1 - α) * self._obs_mem_ewma
+        self._obs_n_samples += 1
+        prev = self.memory_per_job_gb
+        self.memory_per_job_gb = max(self.limits.min_memory_per_job_gb, self._obs_mem_ewma)
+        if abs(self.memory_per_job_gb - prev) > 0.1:
+            logger.info(
+                f"Memory estimate updated: {prev:.2f}GB → {self.memory_per_job_gb:.2f}GB/worker "
+                f"(observed {observed:.2f}GB, ewma={self._obs_mem_ewma:.2f}GB, alive={alive_workers})"
+            )
+
     def handle_oom(self):
-        """Handle out-of-memory error by tightening the memory gate"""
-        self.memory_per_job_gb *= 1.2
-        logger.warning(f"OOM detected: increased memory estimate to {self.memory_per_job_gb:.1f}GB")
+        """Handle out-of-memory error — double estimate so the spawn gate tightens."""
+        prev = self.memory_per_job_gb
+        self.memory_per_job_gb = self.memory_per_job_gb * 2.0
+        self._obs_mem_ewma = self.memory_per_job_gb
+        logger.warning(f"OOM detected: increased memory estimate {prev:.1f}GB → {self.memory_per_job_gb:.1f}GB")
     
     def get_status(self):
-        """Get current system resource status string."""
+        """Get current system resource status string.
+
+        Slurm: shows alloc % (job RSS / allocation) AND machine % side-by-side so the
+        user can tell immediately whether to raise the Slurm memory request.
+        Non-Slurm: shows machine % with free GB.
+        """
         usage = self.get_system_usage()
-        env_type = "SLURM" if self.is_slurm else "SYSTEM"
+        mem = psutil.virtual_memory()
 
-        status = (f"{env_type}: "
-                  f"{usage['memory_available_gb']:.1f}GB free | "
-                  f"{usage['memory_percent']:.0f}% mem | "
-                  f"{usage['cpu_percent']:.0f}% cpu")
+        cpu_str = f"{usage['cpu_percent']:.0f}% cpu"
+        if self.logical_cpus > self.physical_cpus:
+            cpu_str += " (logi)"
 
+        if self.is_slurm:
+            job_rss_gb = self._cached_job_mem_gb
+            alloc_pct = (job_rss_gb / self.available_memory_gb * 100) if self.available_memory_gb else 0
+            mem_str = (f"alloc {alloc_pct:.0f}% ({job_rss_gb:.1f}/{self.available_memory_gb:.0f}GB) | "
+                       f"machine {mem.percent:.0f}%")
+        else:
+            mem_str = f"mem {mem.percent:.0f}% ({usage['memory_available_gb']:.1f}GB free)"
+
+        status = f"{'SLURM' if self.is_slurm else 'SYSTEM'}: {mem_str} | {cpu_str}"
         if usage.get('cpu_per_core'):
-            status += f" | cores: {grouped_bar_graph(usage['cpu_per_core'])}"
-
+            status += f" | {grouped_bar_graph(usage['cpu_per_core'])}"
         return status
     
 
 class GPUJobResourceManager:
-    def __init__(self, memory_per_job_gb=2.0, buffer_gb=0.1, initial_concurrency=2):
+    def __init__(self, memory_per_job_gb=2.0, buffer_gb=0.1, initial_concurrency=2, limits=None):
+        self.limits = limits or ResourceLimits()
         self.memory_per_job_gb = memory_per_job_gb
         self.buffer_gb = buffer_gb
         self.initial_concurrency = initial_concurrency
@@ -319,18 +774,18 @@ class GPUJobResourceManager:
             'last_sample_time': 0,
         })
         self.sample_interval = 1.0
-        self.ewma_alpha = 0.3
+        self.ewma_alpha = self.limits.gpu_ewma_alpha
 
         # Raw memory read cache — avoids a pynvml call on every dispatch decision.
         # TTL is half the EWMA sample_interval so the cache is always fresher than
         # the smoothed metrics but still prevents a pynvml call per scheduler tick.
         self._mem_cache: dict = {}             # gpu_id -> {'total', 'used', 'free', 'ts'}
-        self._mem_cache_ttl: float = self.sample_interval * 0.5
+        self._mem_cache_ttl: float = self.limits.mem_cache_ttl_s * 2  # = sample_interval * 0.5
 
         # Thresholds
-        self.memory_util_threshold = 0.85
-        self.compute_lo_threshold = 0.90   # unsaturate below this
-        self.compute_hi_threshold = 0.95   # saturate at or above this
+        self.memory_util_threshold = self.limits.gpu_memory_util_max
+        self.compute_lo_threshold = self.limits.gpu_compute_lo
+        self.compute_hi_threshold = self.limits.gpu_compute_hi
         self.gpu_saturated: dict = {}      # per-gpu hysteresis flag (set in _init_pynvml)
         
         self._init_slurm_gpus()
@@ -508,22 +963,12 @@ class GPUJobResourceManager:
 class BeeRouter:
     def __init__(self, exploration_rate: float = 0.1):
         self.exploration_rate = exploration_rate
-        self._last_time         = {}  # device → elapsed seconds of last completion
-        self._last_update       = {}  # device → unix timestamp of last completion
-        self._concurrency_limit = {}  # GPU device → AIMD-controlled worker concurrency limit
+        self._last_time   = {}  # device → elapsed seconds of last completion
+        self._last_update = {}  # device → unix timestamp of last completion
 
     def record_completion(self, device: torch.device, elapsed: float):
         self._last_time[device]   = elapsed
         self._last_update[device] = time.time()
-        if device.type == 'cuda':
-            # AIMD: compare GPU exec time against CPU exec time (apples-to-apples).
-            # total_time (queue-wait + exec) is intentionally not used here — it inflates
-            # the GPU metric and causes the multiplicative arm to always fire, killing workers.
-            # GPU memory/compute gates already throttle concurrency; only grow the limit.
-            cpu_t   = next((self._last_time[d] for d in self._last_time if d.type == 'cpu'), None)
-            current = self._concurrency_limit.get(device, 1)
-            if cpu_t is None or elapsed < cpu_t:
-                self._concurrency_limit[device] = current + 1       # additive increase
 
     def rank_devices(self, devices: list, default_t: float = 60.0) -> list:
         """Epsilon-greedy device ranking: exploit fastest device most of the time,
@@ -552,16 +997,21 @@ class BeeRouter:
 
 class ComputeJobResourceManager:
     def __init__(self, cpu_memory_per_job_gb=2.0, cpu_cores_per_job=1, gpu_memory_per_job_gb=2.0,
-                 exploration_rate: float = 0.1, cpu_only: bool = False):
+                 exploration_rate: float = 0.1, cpu_only: bool = False, limits=None):
+        self.limits = limits or ResourceLimits()
         self.cpu_manager = CPUJobResourceManager(
             memory_per_job_gb=cpu_memory_per_job_gb,
             cores_per_job=cpu_cores_per_job,
+            limits=self.limits,
         )
 
         self.use_gpu = torch.cuda.is_available() and not cpu_only
         self.gpu_manager = None
         if self.use_gpu:
-            self.gpu_manager = GPUJobResourceManager(memory_per_job_gb=gpu_memory_per_job_gb)
+            self.gpu_manager = GPUJobResourceManager(
+                memory_per_job_gb=gpu_memory_per_job_gb,
+                limits=self.limits,
+            )
 
         # Pre-build device objects once — reused in hot path instead of allocating per call
         self._cpu_device = torch.device('cpu')
