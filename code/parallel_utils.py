@@ -63,17 +63,12 @@ class RunLayout:
 
 RUN = RunLayout()
 
-# Legacy constants — kept so old run directories can still be read
-LOG_DB          = 'log.db'
-
 
 class SQLiteLock:
     """Advisory mutex backed by SQLite BEGIN IMMEDIATE.
 
-    Drop-in replacement for the former fcntl-based FileBasedLock.  Points to
-    the grid-search log.db, removing the need for a separate lock file and
-    the fcntl dependency.  Works across all processes on this node and across
-    nodes sharing the same NFS/Lustre path.
+    Works across all processes on this node and across nodes sharing the same
+    NFS/Lustre path.
 
     Picklable (stores only path) — each worker process unpickles its own
     instance and opens a fresh connection on acquire(), which is what
@@ -97,21 +92,6 @@ class SQLiteLock:
                 raise
             self._conn = conn
         _db_retry(_try, max_retries=5, base_wait=2.0)
-
-    def try_acquire(self, timeout: float = 0.0) -> bool:
-        """Non-blocking acquire attempt. Returns True if lock obtained, False if busy."""
-        try:
-            conn = sqlite3.connect(self._path, timeout=timeout, isolation_level=None)
-            conn.execute(f"PRAGMA busy_timeout={max(int(timeout * 1000), 0)}")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError:
-                conn.close()
-                return False
-            self._conn = conn
-            return True
-        except sqlite3.OperationalError:
-            return False
 
     def release(self):
         if self._conn is not None:
@@ -190,12 +170,11 @@ class GridSearchDB:
                     time.sleep(wait)
                 elif is_corrupt:
                     logger.warning(
-                        f"log.db corrupted (killed mid-write?) — deleting and recreating "
-                        f"(recover_results will reconstruct from parquet): {e}"
+                        f"state.db corrupted (killed mid-write?) — deleting and recreating "
+                        f"(_reconstruct_state will rebuild from data/*.parquet): {e}"
                     )
                     for suffix in ('', '-journal', '-wal', '-shm'):
                         Path(str(db_path) + suffix).unlink(missing_ok=True)
-                    # fall through to next attempt; generic_parallel_grid_search will call recover_results
                 else:
                     raise
 
@@ -473,11 +452,12 @@ def grouped_bar_graph(values, width=32):
 class CPUJobResourceManager:
     """CPU resource manager with SLURM support"""
 
-    def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, limits=None):
+    def __init__(self, memory_per_job_gb=2.0, cores_per_job=1, max_workers=None, limits=None):
         self.limits = limits or ResourceLimits()
         self.memory_per_job_gb = memory_per_job_gb
         self._initial_memory_per_job_gb = memory_per_job_gb
         self.cores_per_job = cores_per_job
+        self.max_workers = max_workers
 
         self._detect_constraints()
         self._log_initialization()
@@ -542,6 +522,8 @@ class CPUJobResourceManager:
         logger.info(f"  Available Memory: {self.available_memory_gb:.1f}GB")
         logger.info(f"  Memory per job: {self.memory_per_job_gb}GB")
         logger.info(f"  Cores per job: {self.cores_per_job}")
+        if self.max_workers is not None:
+            logger.info(f"  Max workers: {self.max_workers} (user cap)")
     
     def _get_allocated_cpu_cores(self):
         """Get the set of CPU core IDs available to this process"""
@@ -996,12 +978,13 @@ class BeeRouter:
 
 
 class ComputeJobResourceManager:
-    def __init__(self, cpu_memory_per_job_gb=2.0, cpu_cores_per_job=1, gpu_memory_per_job_gb=2.0,
-                 exploration_rate: float = 0.1, cpu_only: bool = False, limits=None):
+    def __init__(self, cpu_memory_per_job_gb=2.0, cpu_cores_per_job=1, cpu_max_workers=None,
+                 gpu_memory_per_job_gb=2.0, exploration_rate: float = 0.1, cpu_only: bool = False, limits=None):
         self.limits = limits or ResourceLimits()
         self.cpu_manager = CPUJobResourceManager(
             memory_per_job_gb=cpu_memory_per_job_gb,
             cores_per_job=cpu_cores_per_job,
+            max_workers=cpu_max_workers,
             limits=self.limits,
         )
 
@@ -1060,7 +1043,10 @@ class ComputeJobResourceManager:
 
     @property
     def max_concurrent(self):
-        return self.cpu_manager.available_cpus
+        n = self.cpu_manager.available_cpus // self.cpu_manager.cores_per_job
+        if self.cpu_manager.max_workers is not None:
+            n = min(n, self.cpu_manager.max_workers)
+        return n
 
     @property
     def cores_per_job(self):

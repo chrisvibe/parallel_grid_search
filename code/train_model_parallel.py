@@ -1074,10 +1074,15 @@ class _GridSearchProgress:
             cur_rate = 0.0
 
         avg_rate = node_done / elapsed_s
-        remaining = self._total - global_done
-        eta_s = remaining / avg_rate if avg_rate > 0 else float('inf')
-        eta_str = tqdm.format_interval(int(eta_s)) if eta_s != float('inf') else '?'
-        self._pbar.set_postfix({'eta': eta_str, 'this_node': node_done, 'j/s': f'{cur_rate:.2f}', 'avg': f'{avg_rate:.2f}'})
+        flushing = global_done >= self._total
+        if flushing:
+            self._pbar.set_description("Flushing results")
+            self._pbar.set_postfix({'this_node': node_done, 'j/s': f'{cur_rate:.2f}'})
+        else:
+            remaining = self._total - global_done
+            eta_s = remaining / avg_rate if avg_rate > 0 else float('inf')
+            eta_str = tqdm.format_interval(int(eta_s)) if eta_s != float('inf') else '?'
+            self._pbar.set_postfix({'eta': eta_str, 'this_node': node_done, 'j/s': f'{cur_rate:.2f}', 'avg': f'{avg_rate:.2f}'})
         self._pbar.refresh()
 
 
@@ -1085,7 +1090,6 @@ def _reconstruct_state(
     output_path: Path,
     total_configs: int,
     samples_per_config: int,
-    recover_results: Callable,
 ) -> set:
     """Scan data/*.parquet to collect completed (i,j) pairs, then build state.db atomically.
 
@@ -1128,7 +1132,6 @@ def _ensure_state_db(
     output_path: Path,
     total_configs: int,
     samples_per_config: int,
-    recover_results: Callable,
 ) -> 'GridSearchDB':
     """Thundering-herd protocol: exactly one node builds state.db, others wait.
 
@@ -1165,7 +1168,7 @@ def _ensure_state_db(
     if winner:
         try:
             logger.info(f"Won state reconstruction lock — scanning {RUN.data_dir}/ for completed jobs")
-            done_pairs = _reconstruct_state(output_path, total_configs, samples_per_config, recover_results)
+            done_pairs = _reconstruct_state(output_path, total_configs, samples_per_config)
             logger.info(f"State reconstruction complete: {len(done_pairs)} previously completed jobs recovered")
         finally:
             building_lock_path.unlink(missing_ok=True)
@@ -1189,7 +1192,7 @@ def _ensure_state_db(
                     f"{RUN.building_lock} disappeared without {RUN.state_db} appearing — "
                     f"winner may have crashed; retrying reconstruction"
                 )
-                return _ensure_state_db(output_path, total_configs, samples_per_config, recover_results)
+                return _ensure_state_db(output_path, total_configs, samples_per_config)
             sleep(2.0)
 
     db = GridSearchDB.open(state_path, total_configs, samples_per_config)
@@ -1198,12 +1201,42 @@ def _ensure_state_db(
     return db
 
 
-def _compact_results(data_dir: Path) -> None:
+def _read_batch_files(data_dir: Path) -> tuple[list, list[Path]]:
+    """Read all batch Parquet files from data_dir. Returns (tables, pq_files)."""
+    pq_files = sorted(data_dir.glob('*.parquet'))
+    tables = []
+    for f in pq_files:
+        try:
+            tables.append(pq.read_table(f))
+        except Exception as e:
+            logger.warning(f"Skipping unreadable batch file during compaction: {f.name}: {e}")
+    return tables, pq_files
+
+
+def _dedup_and_write(df, data_dir: Path, n_files: int) -> int:
+    """Dedup on (i,j), write compacted parquet atomically. Returns unique row count."""
+    import pandas as pd
+    before = len(df)
+    df = df.drop_duplicates(subset=['i', 'j'], keep='last').reset_index(drop=True)
+    if len(df) < before:
+        logger.info(f"Compaction: removed {before - len(df)} duplicate rows")
+    result_table = pa.Table.from_pandas(df, preserve_index=False)
+    tmp = data_dir / (RUN.compacted_file + '.tmp')
+    pq.write_table(result_table, tmp)
+    os.replace(str(tmp), str(data_dir / RUN.compacted_file))
+    logger.info(f"Compacted {n_files} batch files ({len(df)} unique results) → data/data.parquet")
+    return len(df)
+
+
+def _compact_results(data_dir: Path, compact_transform=None) -> None:
     """Merge all batch Parquet files in data/ into data/data.parquet.
 
     Skips any existing data.parquet (previous compaction) as input — it will be
     overwritten as the output. Deduplicates on (i,j) keeping the last occurrence,
     then writes atomically via a .tmp file rename.
+
+    compact_transform: optional callable (pd.DataFrame) -> pd.DataFrame applied
+    to the merged DataFrame before writing. Use for one-off data migrations.
     """
     import pandas as pd
 
@@ -1211,34 +1244,18 @@ def _compact_results(data_dir: Path) -> None:
         logger.warning("data/ directory not found — nothing to compact")
         return
 
-    pq_files = sorted(data_dir.glob('*.parquet'))
+    tables, pq_files = _read_batch_files(data_dir)
     if not pq_files:
         logger.warning("No Parquet files found in data/ — data.parquet not written")
         return
-
-    tables = []
-    for f in pq_files:
-        try:
-            tables.append(pq.read_table(f))
-        except Exception as e:
-            logger.warning(f"Skipping unreadable batch file during compaction: {f.name}: {e}")
-
     if not tables:
         logger.warning("All batch files were unreadable — data.parquet not written")
         return
 
-    merged = pa.concat_tables(tables)
-    df = merged.to_pandas()
-    before = len(df)
-    df = df.drop_duplicates(subset=['i', 'j'], keep='last').reset_index(drop=True)
-    if len(df) < before:
-        logger.info(f"Compaction: removed {before - len(df)} duplicate rows")
-
-    result_table = pa.Table.from_pandas(df, preserve_index=False)
-    tmp = data_dir / (RUN.compacted_file + '.tmp')
-    pq.write_table(result_table, tmp)
-    os.replace(str(tmp), str(data_dir / RUN.compacted_file))
-    logger.info(f"Compacted {len(pq_files)} batch files ({len(df)} unique results) → data/data.parquet")
+    df = pa.concat_tables(tables).to_pandas()
+    if compact_transform is not None:
+        df = compact_transform(df)
+    return _dedup_and_write(df, data_dir, len(pq_files))
 
 
 def generic_parallel_grid_search(
@@ -1249,12 +1266,11 @@ def generic_parallel_grid_search(
     output_path: Path,
     save_config: Callable[[Path], None],
     process_results: Callable[[List, List, Path], Any],
-    recover_results: Callable = None,
-    cleanup: Callable = None,
     # Resource parameters
     gpu_memory_per_job_gb: float = 1,
     cpu_memory_per_job_gb: float = 1,
     cpu_cores_per_job: int = 1,
+    cpu_max_workers: int = None,
     history_write_thresh: int = 1000,
     # Routing parameters
     exploration_rate: float = 0.1,
@@ -1262,6 +1278,7 @@ def generic_parallel_grid_search(
     max_retries: int = 3,
     cpu_only: bool = False,
     compact: bool = True,
+    compact_transform=None,
     limits: ResourceLimits | None = None,
 ) -> Tuple[List[Dict], Dict]:
     """Generic parallel grid search.
@@ -1275,7 +1292,6 @@ def generic_parallel_grid_search(
     crash, _ensure_state_db re-scans data/ so only jobs without saved results re-run.
 
     Signature of process_results callback: (entries, marks, batch_file: Path) → any
-    Signature of recover_results callback: (pq_file: Path, samples_per_config) → [(i, j)]
     """
 
     output_path = Path(output_path)
@@ -1309,11 +1325,12 @@ def generic_parallel_grid_search(
     else:
         save_config(output_path)
 
-    db = _ensure_state_db(output_path, total_configs, samples_per_config, recover_results)
+    db = _ensure_state_db(output_path, total_configs, samples_per_config)
 
     resource_manager = ComputeJobResourceManager(
         cpu_memory_per_job_gb=cpu_memory_per_job_gb,
         cpu_cores_per_job=cpu_cores_per_job,
+        cpu_max_workers=cpu_max_workers,
         gpu_memory_per_job_gb=gpu_memory_per_job_gb,
         exploration_rate=exploration_rate,
         cpu_only=cpu_only,
@@ -1388,19 +1405,16 @@ def generic_parallel_grid_search(
             if shutdown.is_set():
                 logger.info(f"Shutdown requested — completed {scheduler.completed_count}/{total_jobs} jobs, {len(scheduler.permanently_failed)} failed")
 
-            if cleanup is not None:
-                cleanup()
-
         # Scheduler thread is joined at this point — flush remaining results.
         write_history(flush=True)
 
         # Compaction: exactly one node merges data/*.parquet → data.parquet.
         # Reuses state.db as the mutex (no separate compact.lock.db file).
-        # All workers are done at this point so no active transactions compete.
-        # flag-exists check inside the lock prevents double compaction when two
-        # nodes reach this point back-to-back.
-        # After compaction, batch parquets and lock/tmp files are removed from data/.
-        # state.db and data.parquet are kept so check_grid.py can inspect completed runs.
+        # Jobs are marked done at claim time, so a compacting node may see all jobs
+        # done in state.db while another node is still computing and hasn't written its
+        # batch file yet.  The flag is therefore only written once the compacted row
+        # count equals total_jobs, ensuring no batch files are lost.  Cleanup of batch
+        # files is deferred until the flag is present (data is confirmed complete).
         # If compact=False or jobs are incomplete, data/ is left as-is.
         _global_done = db.counts().get('done', 0) + db.counts().get('failed', 0)
         if not compact:
@@ -1418,27 +1432,34 @@ def generic_parallel_grid_search(
                     logger.info(f"{RUN.completed_flag} already written — another node handled compaction")
                 else:
                     logger.info(f"All {total_jobs} jobs complete — compacting results")
-                    _compact_results(data_dir)
-                    # Only write the flag if compaction produced data.parquet.
-                    # If another node claimed all jobs but hasn't flushed its batch
-                    # files yet, _compact_results finds nothing and returns early.
-                    # Leaving the flag unwritten lets that node compact when ready.
-                    if (data_dir / RUN.compacted_file).exists():
-                        flag_path.touch()
-                        logger.info(f"Wrote {RUN.completed_flag}")
-                    else:
+                    n_written = _compact_results(data_dir, compact_transform=compact_transform)
+                    if n_written is None:
                         logger.warning(
                             "Compaction found no batch files — results not yet flushed by another node. "
                             "Another node will compact when its results are written."
                         )
+                    elif n_written >= total_jobs:
+                        flag_path.touch()
+                        logger.info(f"Wrote {RUN.completed_flag}")
+                    else:
+                        # Some nodes are still computing claimed jobs and haven't flushed
+                        # their batch files yet.  Leave the flag unwritten so the next node
+                        # to finish compaction can pick up the remaining rows.
+                        logger.info(
+                            f"Compacted {n_written}/{total_jobs} rows — flag deferred until "
+                            f"remaining batch files are flushed by in-flight nodes"
+                        )
             finally:
                 compact_lock.release()
             db.close()
-            _keep = {RUN.state_db, RUN.compacted_file}
-            for f in data_dir.iterdir():
-                if f.is_file() and f.name not in _keep:
-                    f.unlink(missing_ok=True)
-            logger.info(f"Cleaned up batch files from {RUN.data_dir}/ (kept {RUN.state_db} + {RUN.compacted_file})")
+            # Only clean up once data.parquet is confirmed complete.  If the flag isn't
+            # written yet (row count short), preserve batch files for the next compaction.
+            if flag_path.exists() and (data_dir / RUN.compacted_file).exists():
+                _keep = {RUN.state_db, RUN.compacted_file}
+                for f in data_dir.iterdir():
+                    if f.is_file() and f.name not in _keep:
+                        f.unlink(missing_ok=True)
+                logger.info(f"Cleaned up batch files from {RUN.data_dir}/ (kept {RUN.state_db} + {RUN.compacted_file})")
 
         elapsed_time = time() - start_time
         logger.info(f"Grid search {'interrupted' if shutdown.is_set() else 'completed'} in {elapsed_time//3600:.1f}hrs")
