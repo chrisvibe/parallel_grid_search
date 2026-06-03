@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 import pyarrow.parquet as pq
 
+_STATUS_NAMES = {0: 'pending', 1: 'claimed', 2: 'done'}
+
 SYM_OK   = '✓'
 SYM_WARN = '!'
 SYM_BAD  = '✗'
@@ -20,9 +22,10 @@ def check_one(d: Path):
     db_path = data_dir / 'state.db'
 
     with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(
+        raw = conn.execute(
             'SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY COUNT(*) DESC'
         ).fetchall()
+    rows = [(_STATUS_NAMES.get(s, str(s)), n) for s, n in raw]
     total = sum(n for _, n in rows)
     done_db = next((n for s, n in rows if s == 'done'), 0)
     complete = done_db == total

@@ -27,7 +27,6 @@ def _db_retry(fn, max_retries: int = 10, base_wait: float = 0.5):
             )
             time.sleep(wait)
 import psutil
-import pynvml
 import torch
 from collections import defaultdict, deque
 from os import environ, sched_getaffinity
@@ -121,36 +120,82 @@ class SQLiteLock:
         self._conn = None
 
 
+# Job status constants — stored as integers for faster SQLite comparisons and indexing.
+STATUS_PENDING = 0   # not yet started
+STATUS_CLAIMED = 1   # checked out by a node; result not yet written
+STATUS_DONE    = 2   # result written to parquet (or permanently failed)
+_STATUS_NAMES  = {STATUS_PENDING: 'pending', STATUS_CLAIMED: 'claimed', STATUS_DONE: 'done'}
+
+# Sentinel node_id inserted into heartbeats to claim the compaction role.
+# Only one node may hold this at a time; it is deleted when compaction finishes.
+COMPACT_SENTINEL = '__compact__'
+
+
 class GridSearchDB:
     """SQLite-backed job tracker — single source of truth for job state across nodes.
 
-    WAL mode allows concurrent reads from multiple processes with serialised writes,
-    which is safe on Lustre and modern NFS.
+    Job lifecycle: pending (0) → claimed (1) → done (2).
+    status is an INTEGER column; a B-tree index makes pending-job lookups O(log n)
+    rather than a full table scan — important for large nearly-complete grids.
+
+    WAL mode is NOT used (the -shm shared-memory file doesn't propagate reliably over
+    NFS/Lustre). DELETE journal mode uses fcntl byte-range locks, which Lustre supports.
     """
 
     _SCHEMA = """
         CREATE TABLE IF NOT EXISTS jobs (
-            i      INTEGER NOT NULL,
-            j      INTEGER NOT NULL,
-            status TEXT    NOT NULL DEFAULT 'pending',
+            i       INTEGER NOT NULL,
+            j       INTEGER NOT NULL,
+            status  INTEGER NOT NULL DEFAULT 0,
+            node_id TEXT,
             PRIMARY KEY (i, j)
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+        CREATE TABLE IF NOT EXISTS heartbeats (
+            node_id   TEXT NOT NULL PRIMARY KEY,
+            last_seen REAL NOT NULL
         );
     """
 
-    def __init__(self, db_path: Path):
+    # How long (seconds) without a heartbeat before a node is considered dead.
+    HEARTBEAT_TIMEOUT_S: int = 300   # 5 × 60-second heartbeat interval
+
+    def __init__(self, db_path: Path, node_id: str = ''):
         self.db_path = Path(db_path)
+        self.node_id = node_id
         self._lock = threading.Lock()  # serialize cross-thread access to _conn
-        # WAL mode is NOT used: SQLite's WAL relies on the -shm shared-memory file
-        # which does not propagate reliably over NFS/Lustre.  DELETE mode (the default)
-        # uses fcntl byte-range locks, which Lustre supports correctly.
-        # Retry loop handles the NFS race where a second node opens the file while
-        # the first is still writing the schema.
         for attempt in range(30):
             try:
                 conn = sqlite3.connect(str(db_path), timeout=60, check_same_thread=False,
                                        isolation_level=None)
                 conn.execute("PRAGMA busy_timeout=30000")
+
+                # Schema migration: detect old TEXT-status schema and delete the file so
+                # _ensure_state_db falls through to full reconstruction from parquets.
+                col = conn.execute(
+                    "SELECT type FROM pragma_table_info('jobs') WHERE name='status'"
+                ).fetchone()
+                if col is not None and col[0].upper() == 'TEXT':
+                    logger.info(
+                        "state.db has old TEXT status schema — deleting for migration "
+                        "(_reconstruct_state will rebuild from data/*.parquet)"
+                    )
+                    conn.close()
+                    for suffix in ('', '-journal', '-wal', '-shm'):
+                        Path(str(db_path) + suffix).unlink(missing_ok=True)
+                    # Re-open with new schema
+                    conn = sqlite3.connect(str(db_path), timeout=60, check_same_thread=False,
+                                           isolation_level=None)
+                    conn.execute("PRAGMA busy_timeout=30000")
+
                 conn.executescript(self._SCHEMA)  # executescript auto-commits
+
+                # Add node_id column to jobs if upgrading from earlier INTEGER schema.
+                try:
+                    conn.execute("ALTER TABLE jobs ADD COLUMN node_id TEXT")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
                 self._conn = conn
                 break
             except sqlite3.DatabaseError as e:
@@ -182,13 +227,13 @@ class GridSearchDB:
     def _tx(self):
         """Thread-safe explicit transaction on the shared _conn.
 
-        Acquires the instance lock, issues BEGIN, yields the connection,
-        then COMMITs or ROLLBACKs.  Replaces `with self._conn:` to avoid the
-        CPython bug (SystemError: error return without exception set) that
-        surfaces when the connection is shared across threads.
+        Acquires the instance lock, issues BEGIN IMMEDIATE, yields the connection,
+        then COMMITs or ROLLBACKs.  BEGIN IMMEDIATE acquires a RESERVED lock at
+        transaction start, preventing other nodes from starting write transactions
+        concurrently (critical for NFS where DEFERRED transactions have a race window).
         """
         with self._lock:
-            self._conn.execute("BEGIN")
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self._conn
                 self._conn.execute("COMMIT")
@@ -208,62 +253,131 @@ class GridSearchDB:
             return
         with self._tx() as conn:
             conn.executemany(
-                "INSERT OR IGNORE INTO jobs (i, j, status) VALUES (?, ?, 'pending')",
+                "INSERT OR IGNORE INTO jobs (i, j, status) VALUES (?, ?, 0)",
                 [(i, j)
                  for i in range(total_configs)
                  for j in range(samples_per_config)],
             )
 
     def claim_next_batch(self, batch_size: int) -> list:
-        """Atomically claim up to batch_size pending jobs in one transaction.
+        """Atomically claim up to batch_size pending jobs, stamping this node's id.
 
-        Marks claimed jobs as 'done' immediately — data.db PRIMARY KEY is the true
-        uniqueness guarantee, so we don't need a timed lease.  On crash recovery,
-        _sync_jobs_with_data resets any 'done' rows absent from data.db back to
-        'pending' so they get re-run.
+        Transitions status 0→1 (pending→claimed) and records node_id so heartbeat
+        monitoring can reset jobs back to pending if this node dies.
+        The index on status makes the inner SELECT O(log n) even on nearly-complete grids.
 
         Returns a list of (i, j) tuples, possibly shorter than batch_size if few remain.
         """
         with self._tx() as conn:
             rows = conn.execute(
-                "UPDATE jobs SET status='done' "
-                "WHERE rowid IN (SELECT rowid FROM jobs WHERE status='pending' LIMIT ?) "
+                "UPDATE jobs SET status=1, node_id=? "
+                "WHERE rowid IN (SELECT rowid FROM jobs WHERE status=0 LIMIT ?) "
                 "RETURNING i, j",
-                (batch_size,),
+                (self.node_id, batch_size),
             ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
+    def update_heartbeat(self, node_id: str) -> None:
+        """Upsert a liveness timestamp for node_id.  Called every ~60 s by a daemon thread."""
+        def _do():
+            with self._tx() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO heartbeats (node_id, last_seen) "
+                    "VALUES (?, strftime('%s','now'))",
+                    (node_id,),
+                )
+        _db_retry(_do)
+
+    def reset_stale_claimed(self, timeout_s: int | None = None) -> int:
+        """Reset claimed jobs whose node has stopped heartbeating back to pending.
+
+        A job is stale when its node_id:
+          - is NULL (shouldn't happen, but defensive),
+          - has no heartbeat entry (node vanished without cleanup), or
+          - has a heartbeat older than timeout_s seconds.
+
+        Returns the number of jobs reset.
+        """
+        if timeout_s is None:
+            timeout_s = self.HEARTBEAT_TIMEOUT_S
+        def _do():
+            with self._tx() as conn:
+                return conn.execute(
+                    "UPDATE jobs SET status=0, node_id=NULL "
+                    "WHERE status=1 AND ("
+                    "    node_id IS NULL"
+                    "    OR node_id NOT IN (SELECT node_id FROM heartbeats)"
+                    "    OR node_id IN (SELECT node_id FROM heartbeats"
+                    "                  WHERE last_seen < strftime('%s','now') - ?)"
+                    ")",
+                    (timeout_s,),
+                ).rowcount
+        return _db_retry(_do)
+
     def mark_done_batch(self, pairs: list) -> None:
-        """Mark many jobs done in a single transaction — use during recovery to avoid NFS lock storms."""
-        with self._tx() as conn:
-            conn.executemany(
-                "UPDATE jobs SET status='done' WHERE i=? AND j=?",
-                [(i, j) for i, j in pairs],
-            )
+        """Transition status 1→2 (claimed→done) for a batch of (i,j) pairs.
+
+        Called after results are written to parquet, and for permanently-failed jobs.
+        """
+        if not pairs:
+            return
+        def _do():
+            with self._tx() as conn:
+                conn.executemany(
+                    "UPDATE jobs SET status=2 WHERE i=? AND j=?",
+                    [(i, j) for i, j in pairs],
+                )
+        _db_retry(_do)
 
     def counts(self) -> dict:
-        """Return {status: count} for all statuses present in the DB."""
+        """Return {status_name: count} for all statuses present in the DB.
+
+        Integer status values are mapped to their names ('pending', 'claimed', 'done')
+        so callers can use .get('done', 0) etc. regardless of the underlying storage type.
+        """
         def _read():
             with self._lock:
-                return dict(self._conn.execute(
+                raw = dict(self._conn.execute(
                     "SELECT status, COUNT(*) FROM jobs GROUP BY status"
                 ).fetchall())
+            return {_STATUS_NAMES.get(k, str(k)): v for k, v in raw.items()}
         return _db_retry(_read)
 
     @classmethod
-    def open(cls, path: Path, total_configs: int, samples_per_config: int) -> 'GridSearchDB':
-        """Open (or create) the DB and initialise jobs.
-
-        Crash recovery (resetting claimed-but-lost jobs back to pending) is handled
-        by _sync_jobs_with_data in generic_parallel_grid_search, which compares
-        jobs.db against data.db after open() returns.
-        """
-        db = cls(path)
+    def open(cls, path: Path, total_configs: int, samples_per_config: int,
+             node_id: str = '') -> 'GridSearchDB':
+        """Open (or create) the DB and initialise jobs."""
+        db = cls(path, node_id=node_id)
         db.init_jobs(total_configs, samples_per_config)
         return db
 
+    def try_claim_compaction(self) -> bool:
+        """Atomically claim the compaction role via the heartbeats sentinel.
+
+        Returns True if this node won (INSERT succeeded).  All other nodes that
+        call this concurrently will find the sentinel already present and get False.
+        Uses _tx() (BEGIN IMMEDIATE on state.db) — no separate SQLiteLock needed.
+        """
+        def _do():
+            with self._tx() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO heartbeats (node_id, last_seen) "
+                    "VALUES (?, strftime('%s','now'))",
+                    (COMPACT_SENTINEL,),
+                )
+                return conn.execute("SELECT changes()").fetchone()[0] == 1
+        return _db_retry(_do)
+
+    def release_compaction_claim(self) -> None:
+        """Remove the compaction sentinel so future runs can compact again."""
+        def _do():
+            with self._tx() as conn:
+                conn.execute("DELETE FROM heartbeats WHERE node_id=?", (COMPACT_SENTINEL,))
+        _db_retry(_do)
+
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:   # wait for any in-flight _tx() to finish before closing
+            self._conn.close()
 
 
 class JobInterface(ABC):
@@ -311,7 +425,8 @@ class JobGenerator:
 
     When db is None: sequential iteration over all (i,j) pairs (single-node mode).
     When db is set: jobs are claimed atomically from the DB (multi-node mode).
-    Claiming immediately marks jobs 'done' — data.db PRIMARY KEY is the dedup guarantee.
+    Claiming transitions jobs to status=1 (claimed); status=2 (done) is set after the
+    result is written to parquet via mark_done_batch.
     """
     job_factory: Callable
     total_configs: int
@@ -794,12 +909,14 @@ class GPUJobResourceManager:
                 raise RuntimeError("No GPUs available")
 
     def _handle(self, gpu_id):
-        return pynvml.nvmlDeviceGetHandleByIndex(self._physical_id[gpu_id])
+        return self._pynvml.nvmlDeviceGetHandleByIndex(self._physical_id[gpu_id])
 
     def _init_pynvml(self):
         """Initialize NVIDIA ML library and GPU tracking"""
+        import pynvml  # lazy: only needed when GPU jobs are actually used
+        self._pynvml = pynvml
         try:
-            pynvml.nvmlInit()
+            self._pynvml.nvmlInit()
         except Exception as e:
             raise RuntimeError(f"pynvml initialization failed: {e}")
         
@@ -807,10 +924,10 @@ class GPUJobResourceManager:
         for gpu_id in self.available_gpus:
             try:
                 handle = self._handle(gpu_id)
-                device_name = pynvml.nvmlDeviceGetName(handle)
+                device_name = self._pynvml.nvmlDeviceGetName(handle)
                 if isinstance(device_name, bytes):
                     device_name = device_name.decode('utf-8')
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                mem_info = self._pynvml.nvmlDeviceGetMemoryInfo(handle)
                 
                 logger.info(f"GPU {gpu_id}: {device_name}, "
                            f"Total Memory: {mem_info.total/(1024**3):.2f}GB")
@@ -850,7 +967,7 @@ class GPUJobResourceManager:
                 total, used, free = cache['total'], cache['used'], cache['free']
             else:
                 handle = self._handle(gpu_id)
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                mem_info = self._pynvml.nvmlDeviceGetMemoryInfo(handle)
                 total, used, free = mem_info.total, mem_info.used, mem_info.free
                 self._mem_cache[gpu_id] = {'total': total, 'used': used, 'free': free, 'ts': current_time}
 
@@ -860,7 +977,7 @@ class GPUJobResourceManager:
                 self._update_ewma_metric(gpu_id, 'memory_util', mem_frac)
                 try:
                     handle = self._handle(gpu_id)
-                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    util = self._pynvml.nvmlDeviceGetUtilizationRates(handle)
                     self._update_ewma_metric(gpu_id, 'compute_util', util.gpu / 100.0)
                 except Exception:
                     pass  # some GPUs don't support utilisation rates; EWMA stays at 0
@@ -988,6 +1105,14 @@ class ComputeJobResourceManager:
             limits=self.limits,
         )
 
+        if cpu_only:
+            # Hide GPUs in the parent process before any workers are spawned so
+            # the env var is inherited by children before torch probes CUDA.
+            # Setting it in worker_function_cpu (child-side) is too late — spawn
+            # mode already triggered torch.cuda initialisation during module import,
+            # causing the "CUDA unknown error / changing CUDA_VISIBLE_DEVICES after
+            # program start" warning even when no GPU work is requested.
+            environ['CUDA_VISIBLE_DEVICES'] = ''
         self.use_gpu = torch.cuda.is_available() and not cpu_only
         self.gpu_manager = None
         if self.use_gpu:

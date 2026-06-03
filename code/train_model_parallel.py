@@ -589,6 +589,7 @@ class ResourceAwareScheduler:
 
         self.db = db
         self._pending_marks: list = []  # (i,j) pairs to mark done after next Parquet flush
+        self._history_lock = threading.Lock()  # serialises the two-step append to history + _pending_marks
 
         self._start_job_submissions(job_generator)
 
@@ -666,18 +667,11 @@ class ResourceAwareScheduler:
         if result['status'] == 'completed':
             exec_time  = result['stop_time'] - result['start_time']
             self.resource_manager.bee_router.record_completion(device, exec_time)
-            if 'history' in result:
-                self.history.append(result['history'])
+            with self._history_lock:
+                if 'history' in result:
+                    self.history.append(result['history'])
+                self._pending_marks.append((job.i, job.j))
             self._completed_count += 1
-            self._pending_marks.append((job.i, job.j))
-            # TODO: history and _pending_marks are appended by the scheduler thread
-            # and snapshot-read by write_history on the main thread without a lock.
-            # In CPython the GIL makes each list.append atomic, but there is a
-            # one-bytecode window between the two appends where write_history could
-            # snapshot a mismatched pair (history N+1, pending_marks N).  The result
-            # is that one entry is silently skipped and re-runs next session.
-            # Fix: hold _in_flight_lock (or a dedicated lock) around both appends
-            # and both del/clear calls in write_history.
             logger.debug(f"Completed job {job.i}-{job.j} on {device} in {exec_time:.1f}s")
 
         elif result['status'] == 'error':
@@ -708,8 +702,8 @@ class ResourceAwareScheduler:
         if count > self.max_retries:
             logger.error(f"Job {i}-{j} permanently failed after {self.max_retries} retries: {reason}")
             self.permanently_failed.add(key)
-            # No unclaim needed — job is already 'done' in jobs.db (claimed=done).
-            # On next run, _sync_jobs_with_data resets it to pending (no row in data.db).
+            if self.db is not None:
+                self.db.mark_done_batch([(i, j)])  # advance to done so it doesn't block compaction
             return
 
         logger.warning(f"Retrying job {i}-{j} (attempt {count}/{self.max_retries}): {reason}")
@@ -1074,9 +1068,9 @@ class _GridSearchProgress:
             cur_rate = 0.0
 
         avg_rate = node_done / elapsed_s
-        flushing = global_done >= self._total
-        if flushing:
-            self._pbar.set_description("Flushing results")
+        complete = global_done >= self._total
+        if complete:
+            self._pbar.set_description("Compacting")
             self._pbar.set_postfix({'this_node': node_done, 'j/s': f'{cur_rate:.2f}'})
         else:
             remaining = self._total - global_done
@@ -1124,7 +1118,14 @@ def _reconstruct_state(
         db.mark_done_batch(list(done_pairs))
     db.close()
 
-    os.replace(str(tmp_path), str(state_path))
+    try:
+        os.replace(str(tmp_path), str(state_path))
+    except FileNotFoundError:
+        # Two nodes both won the O_CREAT|O_EXCL race on NFS (non-atomic).
+        # The other node already renamed state.db.tmp → state.db; our tmp is gone.
+        # state.db is consistent — just continue.
+        if not state_path.exists():
+            raise  # genuinely missing, not a race win by another node
     return done_pairs
 
 
@@ -1132,10 +1133,12 @@ def _ensure_state_db(
     output_path: Path,
     total_configs: int,
     samples_per_config: int,
+    node_id: str = '',
 ) -> 'GridSearchDB':
     """Thundering-herd protocol: exactly one node builds state.db, others wait.
 
-    If state.db already exists, opens it immediately (fast path).  Otherwise,
+    If state.db already exists, opens it immediately (fast path) and resets any
+    claimed jobs from dead nodes (heartbeat-based crash recovery).  Otherwise,
     races to atomically create BUILDING_LOCK.  The winner runs _reconstruct_state
     and removes the lock; losers wait, watching for the lock to disappear and
     state.db to appear.
@@ -1148,9 +1151,15 @@ def _ensure_state_db(
     building_lock_path = data_dir / RUN.building_lock
 
     if state_path.exists():
-        db = GridSearchDB.open(state_path, total_configs, samples_per_config)
-        done = db.counts().get('done', 0)
-        logger.info(f"Loaded state.db: {done}/{total_configs * samples_per_config} done")
+        db = GridSearchDB.open(state_path, total_configs, samples_per_config, node_id=node_id)
+        n_stale = db.reset_stale_claimed()
+        if n_stale:
+            logger.warning(f"Reset {n_stale} stale claimed jobs from dead nodes")
+        _startup_counts = db.counts()
+        logger.info(
+            f"Loaded state.db: {_startup_counts.get('done', 0)}/{total_configs * samples_per_config} done, "
+            f"{_startup_counts.get('claimed', 0)} claimed (in-flight from previous run)"
+        )
         return db
 
     # Race to win reconstruction: O_CREAT|O_EXCL is atomic on POSIX local filesystems.
@@ -1192,17 +1201,23 @@ def _ensure_state_db(
                     f"{RUN.building_lock} disappeared without {RUN.state_db} appearing — "
                     f"winner may have crashed; retrying reconstruction"
                 )
-                return _ensure_state_db(output_path, total_configs, samples_per_config)
+                return _ensure_state_db(output_path, total_configs, samples_per_config, node_id)
             sleep(2.0)
 
-    db = GridSearchDB.open(state_path, total_configs, samples_per_config)
+    db = GridSearchDB.open(state_path, total_configs, samples_per_config, node_id=node_id)
     done = db.counts().get('done', 0)
     logger.info(f"State.db ready: {done}/{total_configs * samples_per_config} done")
     return db
 
 
 def _read_batch_files(data_dir: Path) -> tuple[list, list[Path]]:
-    """Read all batch Parquet files from data_dir. Returns (tables, pq_files)."""
+    """Read all Parquet files in data_dir for compaction. Returns (tables, pq_files).
+
+    Includes data.parquet (previous partial compaction) so results whose original
+    batch files were cleaned up after an earlier successful compaction are not lost.
+    The regression guard in _dedup_and_write prevents overwriting data.parquet with
+    fewer rows if a stale-cache-triggered re-compaction sees fewer batch files.
+    """
     pq_files = sorted(data_dir.glob('*.parquet'))
     tables = []
     for f in pq_files:
@@ -1214,12 +1229,29 @@ def _read_batch_files(data_dir: Path) -> tuple[list, list[Path]]:
 
 
 def _dedup_and_write(df, data_dir: Path, n_files: int) -> int:
-    """Dedup on (i,j), write compacted parquet atomically. Returns unique row count."""
+    """Dedup on (i,j), write compacted parquet atomically. Returns unique row count.
+
+    Regression guard: never overwrites an existing data.parquet with fewer rows.
+    This protects against a stale-cache-triggered re-compaction on NFS writing a
+    partial result over an already-complete file.
+    """
     import pandas as pd
     before = len(df)
     df = df.drop_duplicates(subset=['i', 'j'], keep='last').reset_index(drop=True)
     if len(df) < before:
         logger.info(f"Compaction: removed {before - len(df)} duplicate rows")
+    existing = data_dir / RUN.compacted_file
+    if existing.exists():
+        try:
+            existing_n = pq.read_metadata(str(existing)).num_rows
+            if len(df) < existing_n:
+                logger.info(
+                    f"Skipping write — new result ({len(df)} rows) < existing ({existing_n} rows); "
+                    f"keeping the more complete version"
+                )
+                return existing_n
+        except Exception:
+            pass  # unreadable existing file — proceed with overwrite
     result_table = pa.Table.from_pandas(df, preserve_index=False)
     tmp = data_dir / (RUN.compacted_file + '.tmp')
     pq.write_table(result_table, tmp)
@@ -1248,6 +1280,13 @@ def _compact_results(data_dir: Path, compact_transform=None) -> None:
     if not pq_files:
         logger.warning("No Parquet files found in data/ — data.parquet not written")
         return
+    compacted = data_dir / RUN.compacted_file
+    if pq_files == [compacted]:
+        # Only data.parquet exists — nothing new to merge; return its current row count.
+        try:
+            return pq.read_metadata(str(compacted)).num_rows
+        except Exception:
+            pass  # fall through to full compaction if unreadable
     if not tables:
         logger.warning("All batch files were unreadable — data.parquet not written")
         return
@@ -1306,7 +1345,7 @@ def generic_parallel_grid_search(
     data_dir.mkdir(exist_ok=True)
 
     import socket as _socket
-    _node_name = f'{_socket.gethostname()}_{os.getpid()}'
+    _node_name = f'{_socket.gethostname()}_{os.getpid()}_{int(time())}'
 
     params_file = output_path / 'parameters.yaml'
     if params_file.exists():
@@ -1325,7 +1364,7 @@ def generic_parallel_grid_search(
     else:
         save_config(output_path)
 
-    db = _ensure_state_db(output_path, total_configs, samples_per_config)
+    db = _ensure_state_db(output_path, total_configs, samples_per_config, node_id=_node_name)
 
     resource_manager = ComputeJobResourceManager(
         cpu_memory_per_job_gb=cpu_memory_per_job_gb,
@@ -1350,19 +1389,34 @@ def generic_parallel_grid_search(
         nonlocal _batch_seq
         if not flush and len(history) < thresh:
             return
-        n = len(history)
-        entries = history[:n]
-        del history[:n]
-        # Consume exactly n marks — leave any extras for the next flush rather
-        # than clearing them all and losing the (i,j) keys for unpaired entries.
-        marks = scheduler._pending_marks[:n]
-        del scheduler._pending_marks[:n]
+        with scheduler._history_lock:
+            n = len(history)
+            entries = history[:n]
+            del history[:n]
+            # Consume exactly n marks — always paired with entries under the lock.
+            marks = scheduler._pending_marks[:n]
+            del scheduler._pending_marks[:n]
 
         if entries:
             _batch_seq += 1
             batch_file = data_dir / f'{_node_name}_{_batch_seq:06d}.parquet'
             process_results(entries, marks, batch_file)
+            db.mark_done_batch(marks)  # transition claimed→done now that results are on disk
             logger.info(f"Wrote batch {_batch_seq}: {len(entries)} results [{scheduler._completed_count}/{total_jobs}]  e.g. {entries[0]}")
+
+    # Heartbeat daemon: stamps this node alive every HEARTBEAT_INTERVAL_S seconds.
+    # Other nodes use the heartbeats table to detect crashes and reclaim stale jobs.
+    _HEARTBEAT_INTERVAL_S = GridSearchDB.HEARTBEAT_TIMEOUT_S // 5  # 60 s default
+    _hb_stop = threading.Event()
+    def _heartbeat_loop():
+        db.update_heartbeat(_node_name)
+        while not _hb_stop.wait(_HEARTBEAT_INTERVAL_S):
+            try:
+                db.update_heartbeat(_node_name)
+            except Exception as e:
+                logger.warning(f"Heartbeat write failed: {e}")
+    _hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name='heartbeat')
+    _hb_thread.start()
 
     prev_sigterm = signal.signal(signal.SIGTERM, _on_signal)
     prev_sigint = signal.signal(signal.SIGINT, _on_signal)
@@ -1382,16 +1436,22 @@ def generic_parallel_grid_search(
             start_time = time()
             total_jobs = total_configs * samples_per_config
             _initial = db.counts()
-            _initial_done = _initial.get('done', 0) + _initial.get('failed', 0)
+            _initial_done = _initial.get('done', 0)
             with _GridSearchProgress(total=total_jobs, initial=_initial_done) as pbar:
                 _last_counts_t = 0.0
+                _last_stale_reset_t = 0.0
                 overall = _initial
                 while not shutdown.is_set():
                     now_t = time()
                     if now_t - _last_counts_t >= 10.0:
                         overall = db.counts()
                         _last_counts_t = now_t
-                    global_done = overall.get('done', 0) + overall.get('failed', 0)
+                    if now_t - _last_stale_reset_t >= GridSearchDB.HEARTBEAT_TIMEOUT_S:
+                        n_stale = db.reset_stale_claimed()
+                        if n_stale:
+                            logger.warning(f"Reclaimed {n_stale} jobs from dead nodes")
+                        _last_stale_reset_t = now_t
+                    global_done = overall.get('done', 0)
                     node_done = scheduler.completed_count + len(scheduler.permanently_failed)
                     elapsed_s = max(1.0, time() - start_time)
                     pbar.update(global_done, node_done, elapsed_s)
@@ -1409,57 +1469,70 @@ def generic_parallel_grid_search(
         write_history(flush=True)
 
         # Compaction: exactly one node merges data/*.parquet → data.parquet.
-        # Reuses state.db as the mutex (no separate compact.lock.db file).
-        # Jobs are marked done at claim time, so a compacting node may see all jobs
-        # done in state.db while another node is still computing and hasn't written its
-        # batch file yet.  The flag is therefore only written once the compacted row
-        # count equals total_jobs, ensuring no batch files are lost.  Cleanup of batch
-        # files is deferred until the flag is present (data is confirmed complete).
-        # If compact=False or jobs are incomplete, data/ is left as-is.
-        _global_done = db.counts().get('done', 0) + db.counts().get('failed', 0)
+        # Claim election uses db.try_claim_compaction() (BEGIN IMMEDIATE on state.db,
+        # milliseconds) so only one node does the heavy file I/O.  All other nodes
+        # skip immediately, keeping mark_done_batch / update_heartbeat unblocked.
+        _global_counts = db.counts()
+        # Use only status=2 (done = result written to parquet) as the trigger.
+        # Including status=1 (claimed = in flight) caused premature compaction: a node
+        # that finishes early sees claimed+done==total even though other nodes haven't
+        # flushed yet, compacts with a partial row count, and exits — leaving a gap.
+        _n_done   = _global_counts.get('done', 0)
+        _n_pending = _global_counts.get('pending', 0) + _global_counts.get('claimed', 0)
         if not compact:
             logger.info("Compaction disabled — results remain as batch files in data/")
-        elif _global_done < total_jobs:
+        elif _n_pending > 0:
             logger.info(
-                f"Skipping compaction: {_global_done}/{total_jobs} globally done — "
-                f"another node will compact when complete"
+                f"Skipping compaction: {_n_done}/{total_jobs} results flushed, "
+                f"{_n_pending} jobs still in flight — another node will compact when complete"
             )
         else:
-            compact_lock = SQLiteLock(db.db_path)
-            compact_lock.acquire()
-            try:
-                if flag_path.exists():
-                    logger.info(f"{RUN.completed_flag} already written — another node handled compaction")
-                else:
-                    logger.info(f"All {total_jobs} jobs complete — compacting results")
-                    n_written = _compact_results(data_dir, compact_transform=compact_transform)
-                    if n_written is None:
-                        logger.warning(
-                            "Compaction found no batch files — results not yet flushed by another node. "
-                            "Another node will compact when its results are written."
-                        )
-                    elif n_written >= total_jobs:
+            if flag_path.exists():
+                logger.info(f"{RUN.completed_flag} already written — another node handled compaction")
+            elif not db.try_claim_compaction():
+                # Another node atomically inserted the sentinel first — let it handle compaction.
+                logger.info("Another node claimed compaction — skipping")
+            else:
+                # This node won the claim.  Heavy I/O runs outside any lock so other nodes'
+                # mark_done_batch / update_heartbeat calls are never blocked.
+                logger.info(f"All {total_jobs} jobs done — compacting results")
+                n_written = _compact_results(data_dir, compact_transform=compact_transform)
+
+                def _finish(flag_msg):
+                    if not flag_path.exists():
                         flag_path.touch()
-                        logger.info(f"Wrote {RUN.completed_flag}")
+                        logger.info(flag_msg)
+                    if flag_path.exists() and (data_dir / RUN.compacted_file).exists():
+                        _keep = {RUN.state_db, RUN.compacted_file}
+                        for f in data_dir.iterdir():
+                            if f.is_file() and f.name not in _keep:
+                                f.unlink(missing_ok=True)
+                        logger.info(f"Cleaned up batch files from {RUN.data_dir}/ (kept {RUN.state_db} + {RUN.compacted_file})")
+
+                if n_written is None:
+                    logger.warning(
+                        "Compaction found no batch files — results not yet flushed by another node. "
+                        "Another node will compact when its results are written."
+                    )
+                elif n_written >= total_jobs:
+                    _finish(f"Wrote {RUN.completed_flag}")
+                else:
+                    n_gap = total_jobs - n_written
+                    if _n_pending == 0:
+                        # No in-flight jobs left — gap is permanently failed jobs
+                        # (marked done in state.db but produced no parquet result).
+                        logger.warning(
+                            f"{n_gap} permanently failed jobs have no parquet result "
+                            f"({n_written}/{total_jobs} rows written)"
+                        )
+                        _finish(f"Wrote {RUN.completed_flag} (with {n_gap} failed jobs)")
                     else:
-                        # Some nodes are still computing claimed jobs and haven't flushed
-                        # their batch files yet.  Leave the flag unwritten so the next node
-                        # to finish compaction can pick up the remaining rows.
                         logger.info(
                             f"Compacted {n_written}/{total_jobs} rows — flag deferred until "
                             f"remaining batch files are flushed by in-flight nodes"
                         )
-            finally:
-                compact_lock.release()
+                db.release_compaction_claim()  # remove sentinel so future restarts can compact
             db.close()
-            # Only clean up once data.parquet is confirmed complete.  If the flag isn't
-            # written yet (row count short), preserve batch files for the next compaction.
-            if flag_path.exists() and (data_dir / RUN.compacted_file).exists():
-                _keep = {RUN.state_db, RUN.compacted_file}
-                for f in data_dir.iterdir():
-                    if f.is_file() and f.name not in _keep:
-                        f.unlink(missing_ok=True)
-                logger.info(f"Cleaned up batch files from {RUN.data_dir}/ (kept {RUN.state_db} + {RUN.compacted_file})")
 
         elapsed_time = time() - start_time
         logger.info(f"Grid search {'interrupted' if shutdown.is_set() else 'completed'} in {elapsed_time//3600:.1f}hrs")
@@ -1468,5 +1541,7 @@ def generic_parallel_grid_search(
         logger.exception(f"Unexpected error in grid search: {e}")
         raise
     finally:
+        _hb_stop.set()              # signal heartbeat loop to exit
+        _hb_thread.join(timeout=5)  # wait so it finishes any in-flight update_heartbeat before db.close()
         signal.signal(signal.SIGTERM, prev_sigterm)
         signal.signal(signal.SIGINT, prev_sigint)
