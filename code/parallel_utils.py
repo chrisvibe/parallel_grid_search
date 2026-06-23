@@ -27,7 +27,6 @@ def _db_retry(fn, max_retries: int = 10, base_wait: float = 0.5):
             )
             time.sleep(wait)
 import psutil
-import torch
 from collections import defaultdict, deque
 from os import environ, sched_getaffinity
 from pathlib import Path
@@ -381,7 +380,7 @@ class JobInterface(ABC):
         logger.debug(f"Running Job {self.i}-{self.j} on device {device}")
         try:
             return self._run(device)
-        except torch.cuda.OutOfMemoryError as e:
+        except MemoryError as e:
             logger.error(f"GPU OOM for job {self.i}-{self.j}")
             return {'status': 'error', 'error_type': 'OOM', 'error': str(e)}
         except Exception as e:
@@ -882,8 +881,8 @@ class GPUJobResourceManager:
                 raise RuntimeError(f"Cannot parse CUDA_VISIBLE_DEVICES: {slurm_gpus}")
 
         if not self.available_gpus:
-            if torch.cuda.is_available():
-                self.available_gpus = list(range(torch.cuda.device_count()))
+            if False:
+                self.available_gpus = list(range(0))
                 self._physical_id = {i: i for i in self.available_gpus}
             else:
                 raise RuntimeError("No GPUs available")
@@ -1015,12 +1014,6 @@ class GPUJobResourceManager:
         # Invalidate raw memory cache so the next dispatch gets a fresh pynvml read.
         self._mem_cache.pop(gpu_id, None)
 
-        try:
-            with torch.cuda.device(gpu_id):
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Failed to clear cache on GPU {gpu_id}: {e}")
 
     def get_status(self):
         """Get current GPU resource status (reads from cache, no direct pynvml call)."""
@@ -1045,7 +1038,7 @@ class BeeRouter:
         self._last_time   = {}  # device → elapsed seconds of last completion
         self._last_update = {}  # device → unix timestamp of last completion
 
-    def record_completion(self, device: torch.device, elapsed: float):
+    def record_completion(self, device: str, elapsed: float):
         self._last_time[device]   = elapsed
         self._last_update[device] = time.time()
 
@@ -1062,7 +1055,7 @@ class BeeRouter:
                       key=lambda d: self._get_effective_weight(d, default_t),
                       reverse=True)
 
-    def _get_effective_weight(self, device: torch.device, default_t: float) -> float:
+    def _get_effective_weight(self, device: str, default_t: float) -> float:
         last_t = self._last_time.get(device)
         if last_t is None:
             return 1.0 / max(default_t, 1e-6)
@@ -1093,7 +1086,7 @@ class ComputeJobResourceManager:
             # causing the "CUDA unknown error / changing CUDA_VISIBLE_DEVICES after
             # program start" warning even when no GPU work is requested.
             environ['CUDA_VISIBLE_DEVICES'] = ''
-        self.use_gpu = torch.cuda.is_available() and not cpu_only
+        self.use_gpu = False and not cpu_only
         self.gpu_manager = None
         if self.use_gpu:
             self.gpu_manager = GPUJobResourceManager(
@@ -1102,9 +1095,9 @@ class ComputeJobResourceManager:
             )
 
         # Pre-build device objects once — reused in hot path instead of allocating per call
-        self._cpu_device = torch.device('cpu')
+        self._cpu_device = 'cpu'
         self._gpu_devices = (
-            {gpu_id: torch.device(f'cuda:{gpu_id}') for gpu_id in self.gpu_manager.available_gpus}
+            {gpu_id: f'cuda:{gpu_id}' for gpu_id in self.gpu_manager.available_gpus}
             if self.use_gpu else {}
         )
 
@@ -1119,7 +1112,7 @@ class ComputeJobResourceManager:
         except Exception:
             return False
 
-    def can_spawn_worker(self, device: torch.device, pending_workers: int = 0) -> bool:
+    def can_spawn_worker(self, device: str, pending_workers: int = 0) -> bool:
         """Spawn gate: CPU check (all workers) + GPU check (CUDA workers only).
 
         pending_workers: workers spawned in this round not yet visible to the OS.
@@ -1128,13 +1121,13 @@ class ComputeJobResourceManager:
         """
         if not self.cpu_manager.has_available_cpu(pending_workers=pending_workers):
             return False
-        if device.type == 'cuda' and self.gpu_manager is not None:
+        if device.startswith('cuda') and self.gpu_manager is not None:
             if not self.gpu_manager._can_allocate_on_gpu(device.index):
                 return False
         return True
 
     def handle_oom(self, device):
-        if device.type == 'cuda':
+        if device.startswith('cuda'):
             gpu_id = device.index
             self.gpu_manager.handle_oom(gpu_id)
         else:

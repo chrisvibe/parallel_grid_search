@@ -5,8 +5,8 @@ from time import sleep, time
 import queue
 import random
 import numpy as np  # Must be imported before torch to avoid MKL/OpenMP threading conflicts in multiprocessing
-import torch.multiprocessing as tmp
-from torch import set_num_threads, set_num_interop_threads
+import multiprocessing as tmp
+tmp.set_start_method("spawn", force=True)  # match torch.multiprocessing default for juliacall safety
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -17,7 +17,6 @@ from typing import Tuple, Callable, List, Dict, Any
 from project.parallel_grid_search.code.parallel_utils import SQLiteLock, GridSearchDB, JobGenerator, ComputeJobResourceManager, ResourceLimits, JobInterface, DATASET_LOCK_KEY, RUN
 import os
 from os import environ
-import torch
 import signal
 import tempfile
 
@@ -35,7 +34,6 @@ def _setup_node_tmp():
     tmp_dir = Path(f'/tmp/{node}')
     tmp_dir.mkdir(exist_ok=True)
     tempfile.tempdir = str(tmp_dir)
-    environ['TORCHINDUCTOR_CACHE_DIR'] = str(tmp_dir / 'torch_cache')
 _setup_node_tmp()
 
 def _apply_mp_workarounds():
@@ -87,7 +85,6 @@ logger = logging.getLogger(__name__)
 def _cuda_health_check(device):
     """Quick CUDA health check — returns True if device is usable, False otherwise."""
     try:
-        test = torch.zeros(1, device=device)
         del test
         return True
     except Exception as e:
@@ -154,20 +151,8 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, device,
             _fin.cancel()
 
     pid = os.getpid()
-    set_num_interop_threads(1)
-    set_num_threads(cores_per_job)
     p = psutil.Process()
 
-    if device.type == 'cuda':
-        try:
-            torch.cuda.set_device(device.index)
-        except Exception as e:
-            logger.error(f"Worker PID {pid}: torch.cuda.set_device({device.index}) FAILED: {e}", exc_info=True)
-            return
-        if not _cuda_health_check(device):
-            logger.error(f"Worker PID {pid}: CUDA {device.index} unusable at startup, exiting")
-            return
-        logger.debug(f"Worker PID {pid}: CUDA {device.index} health check passed")
 
     try:
         p.nice(priority)
@@ -205,9 +190,8 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, device,
             })
         except Exception as e:
             logger.error(f"Worker PID {pid}: UNHANDLED exception in job {job.i}-{job.j} on {device}: {e}", exc_info=True)
-            if device.type == 'cuda':
+            if device.startswith('cuda'):
                 try:
-                    mem_summary = torch.cuda.memory_summary(device, abbreviated=True)
                     logger.error(f"Worker PID {pid}: CUDA memory state on {device}:\n{mem_summary}")
                 except Exception:
                     pass
@@ -244,7 +228,7 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, device,
 
 
 def worker_function_cpu(*args, **kwargs):
-    environ['CUDA_VISIBLE_DEVICES'] = ''  # hide GPU, but torch.compile still works
+    environ['CUDA_VISIBLE_DEVICES'] = ''  # hide GPU
     return worker_function(*args, **kwargs)
 
 def drain_queue(queue):
@@ -268,7 +252,7 @@ class LazyWorkerPool:
     def __init__(self, max_workers, cores_per_job, process_priority=5, device='cpu',
                  can_spawn_fn=None, idle_timeout: float = 120.0, job_timeout: float = 3600.0,
                  spawn_delay: float = 30.0, max_scale: int = 1):
-        self.device = torch.device(device)
+        self.device = device
         self.max_workers = max_workers
         self.cores_per_job = cores_per_job
         self.process_priority = process_priority
@@ -286,7 +270,7 @@ class LazyWorkerPool:
         self._alive_count = 0   # maintained by _spawn_one_worker / _cleanup_dead_workers
         self._enabled = True
         # GPU starts at 1 (AIMD grows it); CPU starts uncapped at max_workers
-        self._concurrency_limit = 1 if self.device.type == 'cuda' else max_workers
+        self._concurrency_limit = 1 if self.device.startswith('cuda') else max_workers
         self._sigkill_detected = False
         self._in_backoff = False
         self._last_recovery_time: float = 0.0
@@ -354,7 +338,7 @@ class LazyWorkerPool:
 
     def _spawn_one_worker(self):
         """Spawn a single new worker process."""
-        target = worker_function if self.device.type == 'cuda' else worker_function_cpu
+        target = worker_function if self.device.startswith('cuda') else worker_function_cpu
         max_jobs = int(os.environ.get('WORKER_MAX_JOBS', '0')) or None
         # Jitter idle_timeout per-worker so a cohort that all go idle together doesn't
         # all time out simultaneously — staggered deaths avoid the mass-death→stale-RSS
@@ -551,13 +535,13 @@ class ResourceAwareScheduler:
         cpu_pool = LazyWorkerPool(
             max_workers=_effective_cores,
             cores_per_job=self.resource_manager.cores_per_job,
-            process_priority=15, can_spawn_fn=_make_can_spawn(torch.device('cpu')),
+            process_priority=15, can_spawn_fn=_make_can_spawn('cpu'),
             max_scale=max(1, int(_effective_cores * 0.1)),
         )
         self.worker_pools[cpu_pool.device] = cpu_pool
         if self.resource_manager.use_gpu:
             for gpu_id in self.resource_manager.gpu_manager.available_gpus:
-                gpu_device = torch.device(f'cuda:{gpu_id}')
+                gpu_device = f'cuda:{gpu_id}'
                 gpu_pool = LazyWorkerPool(
                     max_workers=8,  # GPU parallelism is memory-bound; AIMD grows from 1 up to this cap
                     cores_per_job=self.resource_manager.cores_per_job,
@@ -804,7 +788,7 @@ class ResourceAwareScheduler:
 
         # Sync AIMD limits to GPU pools before spawning decisions
         for pool in pools:
-            if pool.device.type == 'cuda':
+            if pool.device.startswith('cuda'):
                 pool.current_concurrency_limit = (
                     self.resource_manager.bee_router._concurrency_limit.get(pool.device, 1)
                 )
@@ -814,7 +798,7 @@ class ResourceAwareScheduler:
         for pool in pools:
             if not pool.enabled:
                 continue
-            if pool.device.type == 'cuda':
+            if pool.device.startswith('cuda'):
                 # GPU queue filling: only gate on GPU memory, not CPU load.
                 # CPU load is the right gate for *worker spawning* (via can_spawn_fn),
                 # but applying it here too starves GPU queues whenever CPU is saturated.
@@ -861,7 +845,7 @@ class ResourceAwareScheduler:
         """
         # Update per-job memory estimate from live measurements so pressure gates
         # self-calibrate without needing the right cpu_memory_per_job_gb at startup.
-        _cpu_pool = next((p for p in self.worker_pools.values() if p.device.type == 'cpu'), None)
+        _cpu_pool = next((p for p in self.worker_pools.values() if p.device == 'cpu'), None)
         cpu_budget_limit: dict = {}  # pool → budget concurrency ceiling
         if _cpu_pool is not None:
             cpu_mgr = self.resource_manager.cpu_manager
