@@ -165,7 +165,6 @@ def simple_parallel_grid_search(
         process_results=process_results,
         cpu_memory_per_job_gb=cpu_memory_per_job_gb,
         cpu_cores_per_job=cpu_cores_per_job,
-        cpu_only=True,
         history_write_thresh=2,
     )
 

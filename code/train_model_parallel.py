@@ -1290,7 +1290,6 @@ def generic_parallel_grid_search(
     save_config: Callable[[Path], None],
     process_results: Callable[[List, List, Path], Any],
     # Resource parameters
-    gpu_memory_per_job_gb: float = 1,
     cpu_memory_per_job_gb: float = 1,
     cpu_cores_per_job: int = 1,
     cpu_max_workers: int = None,
@@ -1299,7 +1298,6 @@ def generic_parallel_grid_search(
     exploration_rate: float = 0.1,
     # Retry parameters
     max_retries: int = 3,
-    cpu_only: bool = False,
     compact: bool = True,
     compact_transform=None,
     limits: ResourceLimits | None = None,
@@ -1354,9 +1352,7 @@ def generic_parallel_grid_search(
         cpu_memory_per_job_gb=cpu_memory_per_job_gb,
         cpu_cores_per_job=cpu_cores_per_job,
         cpu_max_workers=cpu_max_workers,
-        gpu_memory_per_job_gb=gpu_memory_per_job_gb,
         exploration_rate=exploration_rate,
-        cpu_only=cpu_only,
         limits=limits,
     )
 
