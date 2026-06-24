@@ -15,9 +15,9 @@ Usage:
     python simple_example.py --test
 """
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import numpy as np
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
 from time import time, gmtime
 import logging
 import multiprocessing
@@ -40,26 +40,15 @@ logger = logging.getLogger(__name__)
 # Model / data
 # ---------------------------------------------------------------------------
 
-class SimpleLinearModel(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int = 1):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_size),
-        )
-
-    def forward(self, x):
-        return self.network(x)
-
-
 class SyntheticDataset:
-    def __init__(self, n_samples=200, n_features=10, noise=0.1, device='cpu'):
-        X = torch.randn(n_samples, n_features)
-        true_weights = torch.randn(n_features, 1)
-        y = X @ true_weights + noise * torch.randn(n_samples, 1)
-        dataset = torch.utils.data.TensorDataset(X.to(device), y.to(device))
-        self.dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+    def __init__(self, n_samples=200, n_features=10, noise=0.1, seed=42):
+        rng = np.random.default_rng(seed)
+        X = rng.standard_normal((n_samples, n_features))
+        true_weights = rng.standard_normal((n_features, 1))
+        y = X @ true_weights + noise * rng.standard_normal((n_samples, 1))
+        split = int(0.8 * n_samples)
+        self.X_train, self.y_train = X[:split], y[:split].ravel()
+        self.X_test,  self.y_test  = X[split:], y[split:].ravel()
         self.n_features = n_features
 
 
@@ -69,22 +58,19 @@ class SyntheticDataset:
 
 class SimpleParams(BaseModel):
     out_path: Path = Path("out/simple_grid_search_results")
-    learning_rate: float = 0.01
-    hidden_size: int = 64
-    epochs: int = 10
+    alpha: float = 1e-3       # ridge regularisation
     n_samples: int = 200
     n_features: int = 10
     noise: float = 0.1
     seed: int = 42
 
 
-class SimpleLinearJob(JobInterface):
+class SimpleRidgeJob(JobInterface):
     def __init__(self, i, j, total_configs, total_samples, locks, params: SimpleParams):
         super().__init__(i, j, total_configs, total_samples, locks)
         self.params = params
 
-    def _run(self, device):
-        torch.manual_seed(self.params.seed)
+    def _run(self, device=None):
         t0 = time()
 
         with self.locks[DATASET_LOCK_KEY]:
@@ -92,28 +78,22 @@ class SimpleLinearJob(JobInterface):
                 n_samples=self.params.n_samples,
                 n_features=self.params.n_features,
                 noise=self.params.noise,
-                device=device,
+                seed=self.params.seed,
             )
 
-        model = SimpleLinearModel(self.params.n_features, self.params.hidden_size).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=self.params.learning_rate)
-        criterion = nn.MSELoss()
-
-        for _ in range(self.params.epochs):
-            for bx, by in dataset.dataloader:
-                optimizer.zero_grad()
-                criterion(model(bx), by).backward()
-                optimizer.step()
+        model = Ridge(alpha=self.params.alpha)
+        model.fit(dataset.X_train, dataset.y_train)
+        mse = mean_squared_error(dataset.y_test, model.predict(dataset.X_test))
 
         elapsed = time() - t0
-        logger.info(f"{self.get_log_prefix()} done in {elapsed:.2f}s on {device}")
+        logger.info(f"{self.get_log_prefix()} done in {elapsed:.2f}s, mse={mse:.4f}")
         return {
             'status': 'completed',
             'history': {
-                'config': self.i,
-                'sample': self.j,
-                'lr': self.params.learning_rate,
-                'hidden': self.params.hidden_size,
+                'config':  self.i,
+                'sample':  self.j,
+                'alpha':   self.params.alpha,
+                'mse':     mse,
                 'elapsed': elapsed,
             },
         }
@@ -123,11 +103,11 @@ class SimpleLinearJob(JobInterface):
 # Factory / callbacks
 # ---------------------------------------------------------------------------
 
-def create_param_combinations(n_lr=2, n_hidden=2):
+def create_param_combinations(n_alpha=2, n_features=2):
     combos = []
-    for lr in [0.001, 0.01][:n_lr]:
-        for h in [32, 64][:n_hidden]:
-            combos.append(SimpleParams(learning_rate=lr, hidden_size=h))
+    for alpha in [1e-4, 1e-3, 1e-2, 1e-1][:n_alpha]:
+        for n_feat in [10, 20][:n_features]:
+            combos.append(SimpleParams(alpha=alpha, n_features=n_feat))
     return combos
 
 
@@ -138,8 +118,8 @@ class SimpleJobFactory:
     def __call__(self, i, j, total_configs, total_samples, locks):
         params = deepcopy(self.param_combinations[i])
         params.seed = params.seed + i * 1000 + j
-        return SimpleLinearJob(i=i, j=j, total_configs=total_configs,
-                               total_samples=total_samples, locks=locks, params=params)
+        return SimpleRidgeJob(i=i, j=j, total_configs=total_configs,
+                              total_samples=total_samples, locks=locks, params=params)
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +129,13 @@ class SimpleJobFactory:
 def simple_parallel_grid_search(
     output_path,
     samples_per_config: int = 2,
-    n_lr: int = 2,
-    n_hidden: int = 2,
+    n_alpha: int = 2,
+    n_features: int = 2,
     cpu_memory_per_job_gb: float = 0.5,
     cpu_cores_per_job: int = 1,
 ):
     output_path = Path(output_path)
-    param_combinations = create_param_combinations(n_lr, n_hidden)
+    param_combinations = create_param_combinations(n_alpha, n_features)
 
     def save_config(out: Path):
         import yaml
@@ -203,8 +183,8 @@ def _run_node(output_path, samples_per_config, n_configs, results_queue):
         simple_parallel_grid_search(
             output_path=output_path,
             samples_per_config=samples_per_config,
-            n_lr=n_configs // 2,
-            n_hidden=2,
+            n_alpha=n_configs // 2,
+            n_features=2,
         )
         results_queue.put(('ok', str(output_path)))
     except Exception as e:
@@ -220,32 +200,29 @@ def test_grid_search():
     TOTAL     = N_CONFIGS * SAMPLES  # 8
 
     # ------------------------------------------------------------------ #
-    # Test 1: single node — completes all jobs, writes data.parquet and    #
-    # GRID_SEARCH_COMPLETED.flag, then a second call exits immediately.   #
+    # Test 1: single node                                                  #
     # ------------------------------------------------------------------ #
     print("\n[Test 1] Single node — completion and fast-exit on re-run")
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir) / 'run'
 
         simple_parallel_grid_search(out, samples_per_config=SAMPLES,
-                                    n_lr=N_CONFIGS // 2, n_hidden=2)
+                                    n_alpha=N_CONFIGS // 2, n_features=2)
 
         assert (out / RUN.completed_flag).exists(), f"{RUN.completed_flag} not written"
         results = pq.read_table(out / RUN.data_dir / RUN.compacted_file).to_pandas()
-        assert len(results) == TOTAL, f"Expected {TOTAL} rows in data.parquet, got {len(results)}"
-        print(f"  ✓ {TOTAL} jobs done, data.parquet has {len(results)} rows, {RUN.completed_flag} written")
+        assert len(results) == TOTAL, f"Expected {TOTAL} rows, got {len(results)}"
+        print(f"  ✓ {TOTAL} jobs done, data.parquet has {len(results)} rows")
 
-        # Second call should exit immediately (flag present)
         t0 = time()
         simple_parallel_grid_search(out, samples_per_config=SAMPLES,
-                                    n_lr=N_CONFIGS // 2, n_hidden=2)
+                                    n_alpha=N_CONFIGS // 2, n_features=2)
         elapsed = time() - t0
         assert elapsed < 5.0, f"Re-run should exit immediately, took {elapsed:.1f}s"
-        print(f"  ✓ Re-run exited in {elapsed:.2f}s (fast exit via {RUN.completed_flag})")
+        print(f"  ✓ Re-run exited in {elapsed:.2f}s")
 
     # ------------------------------------------------------------------ #
-    # Test 2: concurrent two-node — both processes race for jobs, no      #
-    # duplicates or missing rows in data.parquet.                          #
+    # Test 2: concurrent two-node                                          #
     # ------------------------------------------------------------------ #
     print("\n[Test 2] Concurrent two-node (real multiprocessing)")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -263,16 +240,15 @@ def test_grid_search():
         errors = [r for r in results if r[0] == 'error']
         assert not errors, f"Node errors: {errors}"
 
-        assert (out / RUN.completed_flag).exists(), f"{RUN.completed_flag} not written"
+        assert (out / RUN.completed_flag).exists()
         df = pq.read_table(out / RUN.data_dir / RUN.compacted_file).to_pandas()
         assert len(df) == TOTAL, f"Expected {TOTAL} rows, got {len(df)}"
         dupes = df.duplicated(subset=['i', 'j']).sum()
-        assert dupes == 0, f"{dupes} duplicate (i,j) rows in data.parquet"
+        assert dupes == 0, f"{dupes} duplicate (i,j) rows"
         print(f"  ✓ {TOTAL} jobs done, {len(df)} rows, 0 duplicates")
 
     # ------------------------------------------------------------------ #
-    # Test 3: resume — pre-populate data/ for half the jobs, verify that  #
-    # only the remaining half actually run.                               #
+    # Test 3: resume from partial run                                      #
     # ------------------------------------------------------------------ #
     print("\n[Test 3] Resume from partial run (data/ pre-populated)")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -283,7 +259,6 @@ def test_grid_search():
         data_dir = out / 'data'
         data_dir.mkdir()
 
-        # Write parameters.yaml matching simple_parallel_grid_search's save_config
         param_combinations = create_param_combinations(N_CONFIGS // 2, 2)
         cfg = {
             'total_configs': len(param_combinations),
@@ -293,7 +268,6 @@ def test_grid_search():
         with (out / 'parameters.yaml').open('w') as f:
             yaml.dump(cfg, f, sort_keys=False)
 
-        # Pre-populate data/ with fake results for the first half of jobs
         pre_done = TOTAL // 2
         pre_done_pairs = [(i, j) for i in range(N_CONFIGS) for j in range(SAMPLES)][:pre_done]
         fake_tbl = pa.table({
@@ -302,19 +276,14 @@ def test_grid_search():
             'params_json': pa.array(['{}'] * pre_done),
         })
         pq.write_table(fake_tbl, data_dir / 'pre_done.parquet')
-        files_before = set(data_dir.glob('*.parquet'))
 
-        # Run: _ensure_state_db reconstructs from data/ and marks pre_done jobs done.
-        # Only the remaining jobs should be claimed and run.
         simple_parallel_grid_search(out, samples_per_config=SAMPLES,
-                                    n_lr=N_CONFIGS // 2, n_hidden=2)
+                                    n_alpha=N_CONFIGS // 2, n_features=2)
 
-        remaining = TOTAL - pre_done
-
-        assert (out / RUN.completed_flag).exists(), f"{RUN.completed_flag} not written"
+        assert (out / RUN.completed_flag).exists()
         df = pq.read_table(out / RUN.data_dir / RUN.compacted_file).to_pandas()
-        assert len(df) == TOTAL, f"data.parquet should have all {TOTAL} rows after compaction, got {len(df)}"
-        print(f"  ✓ Ran {remaining} remaining jobs, skipped {pre_done} pre-done; "
+        assert len(df) == TOTAL, f"Expected {TOTAL} rows after compaction, got {len(df)}"
+        print(f"  ✓ Ran {TOTAL - pre_done} remaining jobs, skipped {pre_done} pre-done; "
               f"data.parquet has all {TOTAL} rows")
 
     print("\n✓ All tests passed.")
