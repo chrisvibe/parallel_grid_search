@@ -1069,7 +1069,7 @@ class BeeRouter:
 
 class ComputeJobResourceManager:
     def __init__(self, cpu_memory_per_job_gb=2.0, cpu_cores_per_job=1, cpu_max_workers=None,
-                 gpu_memory_per_job_gb=2.0, exploration_rate: float = 0.1, cpu_only: bool = False, limits=None):
+                 exploration_rate: float = 0.1, limits=None):
         self.limits = limits or ResourceLimits()
         self.cpu_manager = CPUJobResourceManager(
             memory_per_job_gb=cpu_memory_per_job_gb,
@@ -1086,7 +1086,7 @@ class ComputeJobResourceManager:
             # causing the "CUDA unknown error / changing CUDA_VISIBLE_DEVICES after
             # program start" warning even when no GPU work is requested.
             environ['CUDA_VISIBLE_DEVICES'] = ''
-        self.use_gpu = False and not cpu_only
+        self.use_gpu = False
         self.gpu_manager = None
         if self.use_gpu:
             self.gpu_manager = GPUJobResourceManager(
