@@ -1069,7 +1069,7 @@ class BeeRouter:
 
 class ComputeJobResourceManager:
     def __init__(self, cpu_memory_per_job_gb=2.0, cpu_cores_per_job=1, cpu_max_workers=None,
-                 exploration_rate: float = 0.1, limits=None):
+                 exploration_rate: float = 0.1, gpu_memory_per_job_gb=None, limits=None):  # gpu_memory_per_job_gb ignored (CPU-only)
         self.limits = limits or ResourceLimits()
         self.cpu_manager = CPUJobResourceManager(
             memory_per_job_gb=cpu_memory_per_job_gb,
@@ -1078,14 +1078,7 @@ class ComputeJobResourceManager:
             limits=self.limits,
         )
 
-        if cpu_only:
-            # Hide GPUs in the parent process before any workers are spawned so
-            # the env var is inherited by children before torch probes CUDA.
-            # Setting it in worker_function_cpu (child-side) is too late — spawn
-            # mode already triggered torch.cuda initialisation during module import,
-            # causing the "CUDA unknown error / changing CUDA_VISIBLE_DEVICES after
-            # program start" warning even when no GPU work is requested.
-            environ['CUDA_VISIBLE_DEVICES'] = ''
+        environ['CUDA_VISIBLE_DEVICES'] = ''  # CPU-only: hide GPUs
         self.use_gpu = False
         self.gpu_manager = None
         if self.use_gpu:
