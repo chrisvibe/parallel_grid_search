@@ -151,6 +151,8 @@ def worker_function(job_queue, result_queue, cores_per_job, priority, device,
             _fin.cancel()
 
     pid = os.getpid()
+    from threadpoolctl import threadpool_limits
+    threadpool_limits(limits=cores_per_job)  # replaces torch set_num_threads — keeps CPU at ~50% per worker
     p = psutil.Process()
 
 
