@@ -754,6 +754,20 @@ class CPUJobResourceManager:
             # All workers dead — reset stale total so the spawn gate isn't blocked by
             # the peak RSS of the previous worker cohort.
             self._last_total_rss_gb = 0.0
+            # With no live workers there are no RSS observations, so an OOM-inflated
+            # estimate has no decay path and can block spawning forever. Bleed it
+            # back toward the initial estimate (throttled) so spawning resumes.
+            if self.memory_per_job_gb > self._initial_memory_per_job_gb:
+                _now = time.time()
+                if _now - self._obs_last_update >= self.limits.mem_estimate_update_interval_s:
+                    self._obs_last_update = _now
+                    prev = self.memory_per_job_gb
+                    self.memory_per_job_gb = max(
+                        self._initial_memory_per_job_gb, self.memory_per_job_gb * 0.9)
+                    self._obs_mem_ewma = self.memory_per_job_gb
+                    logger.info(
+                        f"No live workers — decaying memory estimate "
+                        f"{prev:.2f}GB → {self.memory_per_job_gb:.2f}GB")
             return
         if alive_workers < self.limits.min_alive_for_estimate:
             return
@@ -803,9 +817,17 @@ class CPUJobResourceManager:
             )
 
     def handle_oom(self):
-        """Handle out-of-memory error — double estimate so the spawn gate tightens."""
+        """Handle out-of-memory error — double estimate so the spawn gate tightens.
+
+        Capped so a single worker still fits the RSS budget: an uncapped estimate
+        (e.g. 53.8GB on a 31GB machine) blocks ALL spawns, and with zero live
+        workers there are no RSS observations to bring it back down.
+        """
         prev = self.memory_per_job_gb
-        self.memory_per_job_gb = self.memory_per_job_gb * 2.0
+        cap = self.available_memory_gb * self.limits.mem_target_fraction * 0.95
+        self.memory_per_job_gb = min(
+            self.memory_per_job_gb * 2.0,
+            max(cap, self.limits.min_memory_per_job_gb))
         self._obs_mem_ewma = self.memory_per_job_gb
         logger.warning(f"OOM detected: increased memory estimate {prev:.1f}GB → {self.memory_per_job_gb:.1f}GB")
     
