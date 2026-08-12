@@ -1122,17 +1122,23 @@ class ResourceAwareScheduler:
 class _GridSearchProgress:
     """Progress bar for grid search — wraps tqdm with multi-node-aware display.
 
-    n/total and elapsed are global. ETA, avg, and j/s are per-node:
-    - ETA: how long this node alone would take to finish the remaining global work
-    - avg: this node's average rate since start (node_done / elapsed)
-    - j/s: this node's current rate (60s sliding window)
-    ETA is computed manually so that n/total can stay global while the rate stays local.
+    n/total, elapsed and ETA are global; the per-node figures sit beside them:
+    - eta:      remaining global work ÷ the rate the whole grid is being cleared at
+    - this_node / node j/s: what this node alone contributed, and its current rate
+      (60 s sliding window) — the number that exposes a node falling behind
+    - all j/s:  the global rate the ETA is derived from, so it can be checked by eye
+
+    ETA is computed manually because tqdm would derive it from this process's own
+    updates.  It used to divide the *global* remaining work by *this node's* rate,
+    which on an 8-node run overstated the time left by roughly 8x — a 21-hour run
+    advertised itself as needing a week.
     """
 
     _BAR_FMT = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {postfix}]'
 
     def __init__(self, total: int, initial: int):
         self._total = total
+        self._initial = initial   # global done at startup; excluded from the rate
         self._rate_window: list[tuple[float, int]] = []
         self._pbar = tqdm(total=total, initial=initial, desc="Grid Search Progress",
                           unit="jobs", bar_format=self._BAR_FMT)
@@ -1160,16 +1166,25 @@ class _GridSearchProgress:
         else:
             cur_rate = 0.0
 
-        avg_rate = node_done / elapsed_s
+        # Rate of the whole grid, not just this process: results landing from every
+        # node count towards the remaining work, so they must count towards the ETA.
+        # Jobs finished before this node started are excluded — they happened outside
+        # the window being measured and would inflate the rate.
+        global_rate = max(0, global_done - self._initial) / elapsed_s
         complete = global_done >= self._total
         if complete:
             self._pbar.set_description("Compacting")
-            self._pbar.set_postfix({'this_node': node_done, 'j/s': f'{cur_rate:.2f}'})
+            self._pbar.set_postfix({'this_node': node_done, 'node j/s': f'{cur_rate:.2f}'})
         else:
             remaining = self._total - global_done
-            eta_s = remaining / avg_rate if avg_rate > 0 else float('inf')
+            eta_s = remaining / global_rate if global_rate > 0 else float('inf')
             eta_str = tqdm.format_interval(int(eta_s)) if eta_s != float('inf') else '?'
-            self._pbar.set_postfix({'eta': eta_str, 'this_node': node_done, 'j/s': f'{cur_rate:.2f}', 'avg': f'{avg_rate:.2f}'})
+            self._pbar.set_postfix({
+                'eta': eta_str,
+                'this_node': node_done,
+                'node j/s': f'{cur_rate:.2f}',
+                'all j/s': f'{global_rate:.2f}',
+            })
         self._pbar.refresh()
 
 

@@ -24,6 +24,7 @@ from project.parallel_grid_search.code.parallel_utils import (
     STATUS_PENDING,
 )
 from project.parallel_grid_search.code.train_model_parallel import (
+    _GridSearchProgress,
     _compact_results,
     _missing_result_pairs,
     _read_batch_files,
@@ -202,6 +203,45 @@ def test_compact_results_returns_row_count_and_unreadable(tmp_path):
     assert n_written == 3, "rows are unique on (i,j)"
     assert unreadable == []
     assert (data_dir / 'data.parquet').exists()
+
+
+# --------------------------------------------------------------------------
+# progress reporting
+# --------------------------------------------------------------------------
+
+def test_eta_is_derived_from_the_whole_grids_rate_not_one_nodes():
+    """A node contributing 1/10th of the throughput must not report a 10x ETA.
+
+    The old maths divided global remaining work by this node's own rate, which
+    on the 8-node PI run advertised ~164 h for what was really a ~21 h job.
+    """
+    pbar = _GridSearchProgress(total=1000, initial=0)
+    try:
+        # 100 jobs cleared grid-wide in 100 s (this node did 10 of them):
+        # 1.0 jobs/s globally, so the remaining 900 need 900 s == 15:00.
+        pbar.update(global_done=100, node_done=10, elapsed_s=100.0)
+        postfix = pbar._pbar.postfix
+    finally:
+        pbar._pbar.close()
+
+    assert 'eta=15:00' in postfix, postfix
+    assert 'all j/s=1.00' in postfix, postfix
+    assert 'this_node=10' in postfix, postfix
+
+
+def test_eta_excludes_work_finished_before_this_node_started():
+    """Resuming a half-done grid must not credit this node's window with the
+    jobs a previous run already finished."""
+    pbar = _GridSearchProgress(total=1000, initial=400)
+    try:
+        # 500 done globally, but 400 predate this node: 100 in 100 s == 1.0 j/s,
+        # so the remaining 500 need 500 s == 08:20.
+        pbar.update(global_done=500, node_done=100, elapsed_s=100.0)
+        postfix = pbar._pbar.postfix
+    finally:
+        pbar._pbar.close()
+
+    assert 'eta=08:20' in postfix, postfix
 
 
 def test_compact_results_on_empty_dir_reports_nothing_written(tmp_path):
