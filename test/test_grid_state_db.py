@@ -83,6 +83,19 @@ def test_failed_is_terminal_but_distinct_from_done(db, tmp_path):
     assert db.unfinished_count() == 3
 
 
+def test_count_live_nodes_ignores_the_compaction_sentinel(db):
+    """The sentinel shares the heartbeats table but is not a node doing work;
+    counting it would inflate the ETA's assumed parallelism."""
+    assert db.count_live_nodes() == 1, "never reports zero — this node is alive"
+
+    db.update_heartbeat('nodeA')
+    db.update_heartbeat('nodeB')
+    assert db.count_live_nodes() == 2
+
+    assert db.try_claim_compaction()
+    assert db.count_live_nodes() == 2, "sentinel must not be counted as a node"
+
+
 def test_unfinished_count_reaches_zero_only_when_nothing_is_left(db):
     assert db.unfinished_count() == 6
     db.claim_next_batch(6)
@@ -209,39 +222,43 @@ def test_compact_results_returns_row_count_and_unreadable(tmp_path):
 # progress reporting
 # --------------------------------------------------------------------------
 
-def test_eta_is_derived_from_the_whole_grids_rate_not_one_nodes():
-    """A node contributing 1/10th of the throughput must not report a 10x ETA.
+def test_eta_accounts_for_every_node_not_just_this_one():
+    """A node doing 1/10th of the work must not report a 10x ETA.
 
-    The old maths divided global remaining work by this node's own rate, which
-    on the 8-node PI run advertised ~164 h for what was really a ~21 h job.
+    The original maths divided global remaining work by this node's own rate,
+    which on the 8-node PI run advertised ~164 h for what was really ~21 h.
     """
     pbar = _GridSearchProgress(total=1000, initial=0)
     try:
-        # 100 jobs cleared grid-wide in 100 s (this node did 10 of them):
-        # 1.0 jobs/s globally, so the remaining 900 need 900 s == 15:00.
-        pbar.update(global_done=100, node_done=10, elapsed_s=100.0)
+        # This node cleared 10 jobs in 100 s (0.1 j/s); 10 nodes are doing the
+        # same, so the grid runs at 1.0 j/s and the remaining 900 need 15:00.
+        pbar.update(global_done=100, node_done=10, elapsed_s=100.0, n_nodes=10)
         postfix = pbar._pbar.postfix
     finally:
         pbar._pbar.close()
 
     assert 'eta=15:00' in postfix, postfix
-    assert 'all j/s=1.00' in postfix, postfix
+    assert 'nodes=10' in postfix, postfix
     assert 'this_node=10' in postfix, postfix
 
 
-def test_eta_excludes_work_finished_before_this_node_started():
-    """Resuming a half-done grid must not credit this node's window with the
-    jobs a previous run already finished."""
-    pbar = _GridSearchProgress(total=1000, initial=400)
+def test_eta_does_not_depend_on_results_having_been_flushed_yet():
+    """The killer case: nodes buffer 1000 results before writing, so the global
+    'done' count can sit still for ~40 min while work is very much happening.
+
+    Deriving the rate from that column made the ETA read in thousands of hours
+    at the start of every run.  It must track this node's own progress instead.
+    """
+    pbar = _GridSearchProgress(total=1000, initial=100)
     try:
-        # 500 done globally, but 400 predate this node: 100 in 100 s == 1.0 j/s,
-        # so the remaining 500 need 500 s == 08:20.
-        pbar.update(global_done=500, node_done=100, elapsed_s=100.0)
+        # global_done has not moved off its starting value at all, yet this node
+        # has finished 10 jobs in 100 s.  8 nodes => 0.8 j/s => 900/0.8 = 18:45.
+        pbar.update(global_done=100, node_done=10, elapsed_s=100.0, n_nodes=8)
         postfix = pbar._pbar.postfix
     finally:
         pbar._pbar.close()
 
-    assert 'eta=08:20' in postfix, postfix
+    assert 'eta=18:45' in postfix, postfix
 
 
 def test_compact_results_on_empty_dir_reports_nothing_written(tmp_path):

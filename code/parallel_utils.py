@@ -382,6 +382,26 @@ class GridSearchDB:
             return row[0]
         return _db_retry(_read)
 
+    def count_live_nodes(self) -> int:
+        """How many nodes are currently heartbeating (compaction sentinel excluded).
+
+        Used to scale one node's observed rate into a whole-grid rate for the ETA.
+        Reading the rate off the 'done' column instead does not work early in a run:
+        that count only moves when a node flushes a full batch, so for the first
+        ~40 minutes it reads as near-zero and the ETA runs to thousands of hours.
+
+        Never returns less than 1 — this node is by definition alive.
+        """
+        def _read():
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM heartbeats "
+                    "WHERE node_id != ? AND last_seen >= strftime('%s','now') - ?",
+                    (COMPACT_SENTINEL, self.HEARTBEAT_TIMEOUT_S),
+                ).fetchone()
+            return max(1, row[0])
+        return _db_retry(_read)
+
     def counts(self) -> dict:
         """Return {status_name: count} for all statuses present in the DB.
 

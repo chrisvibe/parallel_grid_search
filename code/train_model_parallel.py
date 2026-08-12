@@ -1123,22 +1123,33 @@ class _GridSearchProgress:
     """Progress bar for grid search — wraps tqdm with multi-node-aware display.
 
     n/total, elapsed and ETA are global; the per-node figures sit beside them:
-    - eta:      remaining global work ÷ the rate the whole grid is being cleared at
+    - eta:      remaining global work ÷ this node's rate × the number of live nodes
     - this_node / node j/s: what this node alone contributed, and its current rate
       (60 s sliding window) — the number that exposes a node falling behind
-    - all j/s:  the global rate the ETA is derived from, so it can be checked by eye
+    - nodes:    how many nodes the ETA assumes are sharing the work
 
     ETA is computed manually because tqdm would derive it from this process's own
-    updates.  It used to divide the *global* remaining work by *this node's* rate,
-    which on an 8-node run overstated the time left by roughly 8x — a 21-hour run
-    advertised itself as needing a week.
+    updates.  Two earlier versions of this were wrong in opposite directions, and
+    both are worth remembering:
+
+    Dividing global remaining work by *this node's* rate overstated the time left
+    by roughly the node count — an 8-node, 21-hour run advertised itself as needing
+    a week.  Dividing by the rate implied by the global 'done' column fixed the bias
+    but was unusable early on: that column only advances when a node flushes a full
+    1000-row batch, so for the first ~40 minutes it reads near-zero and the ETA runs
+    to thousands of hours.
+
+    Scaling this node's own rate by the live node count is responsive from the first
+    job and unbiased at steady state.  It assumes nodes are roughly equal, which is
+    what --exclusive scheduling on identical hardware gives; 'node j/s' is displayed
+    alongside precisely so a straggler is still visible.
     """
 
     _BAR_FMT = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {postfix}]'
 
     def __init__(self, total: int, initial: int):
         self._total = total
-        self._initial = initial   # global done at startup; excluded from the rate
+        self._initial = initial
         self._rate_window: list[tuple[float, int]] = []
         self._pbar = tqdm(total=total, initial=initial, desc="Grid Search Progress",
                           unit="jobs", bar_format=self._BAR_FMT)
@@ -1153,7 +1164,8 @@ class _GridSearchProgress:
     def __exit__(self, *args):
         return self._stack.__exit__(*args)
 
-    def update(self, global_done: int, node_done: int, elapsed_s: float) -> None:
+    def update(self, global_done: int, node_done: int, elapsed_s: float,
+               n_nodes: int = 1) -> None:
         now = time()
         self._pbar.n = global_done
 
@@ -1166,24 +1178,24 @@ class _GridSearchProgress:
         else:
             cur_rate = 0.0
 
-        # Rate of the whole grid, not just this process: results landing from every
-        # node count towards the remaining work, so they must count towards the ETA.
-        # Jobs finished before this node started are excluded — they happened outside
-        # the window being measured and would inflate the rate.
-        global_rate = max(0, global_done - self._initial) / elapsed_s
+        # Rate of the whole grid, not just this process: every node is chewing through
+        # the same remaining pile, so the ETA has to account for all of them.  Built
+        # from this node's own average (which advances every job) rather than the
+        # global 'done' column (which only advances on a batch flush).
+        grid_rate = (node_done / elapsed_s) * n_nodes
         complete = global_done >= self._total
         if complete:
             self._pbar.set_description("Compacting")
             self._pbar.set_postfix({'this_node': node_done, 'node j/s': f'{cur_rate:.2f}'})
         else:
             remaining = self._total - global_done
-            eta_s = remaining / global_rate if global_rate > 0 else float('inf')
+            eta_s = remaining / grid_rate if grid_rate > 0 else float('inf')
             eta_str = tqdm.format_interval(int(eta_s)) if eta_s != float('inf') else '?'
             self._pbar.set_postfix({
                 'eta': eta_str,
                 'this_node': node_done,
                 'node j/s': f'{cur_rate:.2f}',
-                'all j/s': f'{global_rate:.2f}',
+                'nodes': n_nodes,
             })
         self._pbar.refresh()
 
@@ -1575,10 +1587,15 @@ def generic_parallel_grid_search(
                 _last_counts_t = 0.0
                 _last_stale_reset_t = 0.0
                 overall = _initial
+                _n_nodes = 1   # refreshed with the counts; scales this node's rate into an ETA
                 while not shutdown.is_set():
                     now_t = time()
                     if now_t - _last_counts_t >= 10.0:
                         overall = db.counts()
+                        try:
+                            _n_nodes = db.count_live_nodes()
+                        except Exception as e:
+                            logger.debug(f"Could not count live nodes for the ETA: {e}")
                         _last_counts_t = now_t
                     if now_t - _last_stale_reset_t >= GridSearchDB.HEARTBEAT_TIMEOUT_S:
                         n_stale = db.reset_stale_claimed()
@@ -1588,7 +1605,7 @@ def generic_parallel_grid_search(
                     global_done = overall.get('done', 0)
                     node_done = scheduler.completed_count + len(scheduler.permanently_failed)
                     elapsed_s = max(1.0, time() - start_time)
-                    pbar.update(global_done, node_done, elapsed_s)
+                    pbar.update(global_done, node_done, elapsed_s, _n_nodes)
                     # Flush immediately once this node has drained and has nothing
                     # running: its unflushed results are exactly what keep the last
                     # jobs sitting in 'claimed', and every node — including this one —
