@@ -1,8 +1,13 @@
 """Reset a grid search run directory so it can be re-run or re-compacted.
 
-Removes state files and stale locks/tmps. Never touches batch Parquets or
-data.parquet — those are preserved so a re-run rebuilds state from them and
-goes straight to compaction without recomputing any jobs.
+Removes state files and stale locks/tmps. Never touches readable batch
+Parquets or data.parquet — those are preserved so a re-run rebuilds state
+from them and goes straight to compaction without recomputing any jobs.
+
+Parquets that pyarrow cannot read are quarantined (renamed to
+<name>.corrupt) so state reconstruction recomputes their jobs instead of
+crashing on them. Requires pyarrow; without it the check is skipped with
+a warning. Verification reads each Parquet in full.
 
 Files removed (must stay in sync with RunLayout in parallel_utils.py):
   state.db              — job queue; rebuilt from data/*.parquet on restart
@@ -27,6 +32,25 @@ _RESET_NAMES = frozenset({
 })
 
 
+def quarantine_corrupt_parquets(path: Path) -> int:
+    """Rename unreadable Parquets under path to <name>.corrupt. Returns count."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        print("  warning: pyarrow not available — corrupt-Parquet check skipped")
+        return 0
+    n = 0
+    for f in sorted(path.rglob('*.parquet')):
+        try:
+            pq.read_table(f)
+        except Exception as e:
+            quarantined = f.with_name(f.name + '.corrupt')
+            f.rename(quarantined)
+            print(f"  quarantined corrupt Parquet: {f} -> {quarantined.name} ({e})")
+            n += 1
+    return n
+
+
 def reset_grid(path: Path) -> int:
     """Delete reset-eligible files under path. Returns number of files deleted."""
     n = 0
@@ -35,6 +59,7 @@ def reset_grid(path: Path) -> int:
             f.unlink()
             print(f"  deleted: {f}")
             n += 1
+    n += quarantine_corrupt_parquets(path)
     return n
 
 
