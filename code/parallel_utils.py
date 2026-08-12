@@ -102,8 +102,13 @@ class SQLiteLock:
 # Job status constants — stored as integers for faster SQLite comparisons and indexing.
 STATUS_PENDING = 0   # not yet started
 STATUS_CLAIMED = 1   # checked out by a node; result not yet written
-STATUS_DONE    = 2   # result written to parquet (or permanently failed)
-_STATUS_NAMES  = {STATUS_PENDING: 'pending', STATUS_CLAIMED: 'claimed', STATUS_DONE: 'done'}
+STATUS_DONE    = 2   # result written to parquet
+STATUS_FAILED  = 3   # gave up after max_retries; no parquet row will ever exist
+# DONE and FAILED are both terminal — a job in either is never claimed again.  They
+# are kept apart so compaction can tell an accounted-for gap (failed) from missing
+# rows it cannot explain (data loss), and refuse to flag the grid complete on the latter.
+_STATUS_NAMES  = {STATUS_PENDING: 'pending', STATUS_CLAIMED: 'claimed',
+                  STATUS_DONE: 'done', STATUS_FAILED: 'failed'}
 
 # Sentinel node_id inserted into heartbeats to claim the compaction role.
 # Only one node may hold this at a time; it is deleted when compaction finishes.
@@ -296,23 +301,93 @@ class GridSearchDB:
     def mark_done_batch(self, pairs: list) -> None:
         """Transition status 1→2 (claimed→done) for a batch of (i,j) pairs.
 
-        Called after results are written to parquet, and for permanently-failed jobs.
+        Called only after results are written to parquet, so 'done' always means
+        "a row for this (i,j) exists on disk".  Permanently-failed jobs go to
+        STATUS_FAILED instead — see mark_failed.
         """
         if not pairs:
             return
         def _do():
             with self._tx() as conn:
                 conn.executemany(
-                    "UPDATE jobs SET status=2 WHERE i=? AND j=?",
+                    f"UPDATE jobs SET status={STATUS_DONE} WHERE i=? AND j=?",
                     [(i, j) for i, j in pairs],
                 )
         _db_retry(_do)
 
+    def mark_failed(self, pairs: list) -> None:
+        """Transition a batch of (i,j) pairs to STATUS_FAILED (terminal, no parquet row).
+
+        Kept distinct from 'done' so the compaction step can tell an explained gap
+        (failed jobs) from unexplained data loss (a missing or unreadable batch file)
+        and refuse to declare the grid complete in the latter case.
+        """
+        if not pairs:
+            return
+        def _do():
+            with self._tx() as conn:
+                conn.executemany(
+                    f"UPDATE jobs SET status={STATUS_FAILED} WHERE i=? AND j=?",
+                    [(i, j) for i, j in pairs],
+                )
+        _db_retry(_do)
+
+    def reset_missing_results(self, pairs: list) -> int:
+        """Send jobs marked done whose parquet row is absent back to pending (2→0).
+
+        Only ever called by the compaction step, and only for pairs it verified have
+        no readable row anywhere in data/.  Guarded on status=2 so it cannot resurrect
+        a permanently-failed job or steal a live claim.
+
+        This is what makes a damaged grid repairable: the DB otherwise insists those
+        jobs are finished, so a re-run finds nothing pending and the gap never closes.
+        """
+        if not pairs:
+            return 0
+        def _do():
+            with self._tx() as conn:
+                return conn.executemany(
+                    f"UPDATE jobs SET status={STATUS_PENDING}, node_id=NULL "
+                    f"WHERE i=? AND j=? AND status={STATUS_DONE}",
+                    [(i, j) for i, j in pairs],
+                ).rowcount
+        return _db_retry(_do)
+
+    def reset_to_pending(self, pairs: list) -> int:
+        """Hand claimed-but-unrun jobs back so another node can take them (1→0).
+
+        Guarded on status=1 so a job whose result already landed is never resurrected.
+        Called when a node leaves with jobs still checked out: without this those jobs
+        stay 'claimed' against a dead node, and every surviving node reads them as
+        "someone else is working on it" and declines to compact.
+        """
+        if not pairs:
+            return 0
+        def _do():
+            with self._tx() as conn:
+                return conn.executemany(
+                    f"UPDATE jobs SET status={STATUS_PENDING}, node_id=NULL "
+                    f"WHERE i=? AND j=? AND status={STATUS_CLAIMED}",
+                    [(i, j) for i, j in pairs],
+                ).rowcount
+        return _db_retry(_do)
+
+    def unfinished_count(self) -> int:
+        """Jobs that still need running (pending + claimed).  0 ⇒ the grid is finished."""
+        def _read():
+            with self._lock:
+                row = self._conn.execute(
+                    f"SELECT COUNT(*) FROM jobs WHERE status IN ({STATUS_PENDING}, {STATUS_CLAIMED})"
+                ).fetchone()
+            return row[0]
+        return _db_retry(_read)
+
     def counts(self) -> dict:
         """Return {status_name: count} for all statuses present in the DB.
 
-        Integer status values are mapped to their names ('pending', 'claimed', 'done')
-        so callers can use .get('done', 0) etc. regardless of the underlying storage type.
+        Integer status values are mapped to their names ('pending', 'claimed', 'done',
+        'failed') so callers can use .get('done', 0) etc. regardless of the underlying
+        storage type.  Statuses with no rows are absent from the dict, hence the .get.
         """
         def _read():
             with self._lock:
@@ -412,9 +487,30 @@ class JobGenerator:
     samples_per_config: int
     db: 'GridSearchDB | None' = None
     locks: dict = dataclasses.field(default_factory=dict)
+    # Jobs claimed from the DB but not yet yielded.  An instance attribute rather than
+    # a local so release_buffered() can hand them back if this node leaves — see there.
+    _buffer: deque = dataclasses.field(default_factory=deque, repr=False)
 
     def __len__(self) -> int:
         return self.total_configs * self.samples_per_config
+
+    def release_buffered(self) -> int:
+        """Return claimed-but-unyielded jobs to pending.  Returns how many were freed.
+
+        A node that stops iterating (shutdown, or the grid finishing while its buffer
+        is non-empty) would otherwise strand up to db_claim_batch_size jobs in the
+        'claimed' state, owned by a process that is exiting.  Surviving nodes then see
+        them as in-flight work belonging to someone else and decline to compact, so the
+        grid never gets its completion flag.
+        """
+        if self.db is None or not self._buffer:
+            return 0
+        pairs = list(self._buffer)
+        self._buffer.clear()
+        n = self.db.reset_to_pending(pairs)
+        if n:
+            logger.info(f"Released {n} claimed-but-unrun jobs back to pending")
+        return n
 
     def __iter__(self):
         if self.db is not None:
@@ -422,9 +518,8 @@ class JobGenerator:
             # Without batching, filling a 96-job queue costs 96 round-trips;
             # with batch_size=32 it costs 3.
             _BATCH = ResourceLimits.db_claim_batch_size
-            buffer: deque = deque()
             while True:
-                if not buffer:
+                if not self._buffer:
                     try:
                         batch = self.db.claim_next_batch(_BATCH)
                     except sqlite3.OperationalError as e:
@@ -438,8 +533,8 @@ class JobGenerator:
                         continue
                     if not batch:
                         return
-                    buffer.extend(batch)
-                i, j = buffer.popleft()
+                    self._buffer.extend(batch)
+                i, j = self._buffer.popleft()
                 yield self.job_factory(
                     i=i, j=j,
                     total_configs=self.total_configs,

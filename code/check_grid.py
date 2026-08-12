@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 import pyarrow.parquet as pq
 
-_STATUS_NAMES = {0: 'pending', 1: 'claimed', 2: 'done'}
+_STATUS_NAMES = {0: 'pending', 1: 'claimed', 2: 'done', 3: 'failed'}
 
 SYM_OK   = '✓'
 SYM_WARN = '!'
@@ -28,11 +28,17 @@ def check_one(d: Path):
     rows = [(_STATUS_NAMES.get(s, str(s)), n) for s, n in raw]
     total = sum(n for _, n in rows)
     done_db = next((n for s, n in rows if s == 'done'), 0)
-    complete = done_db == total
+    failed_db = next((n for s, n in rows if s == 'failed'), 0)
+    # 'failed' is terminal and yields no parquet row, so a grid with nothing left to
+    # run is complete even though done_db < total.  done_db stays the expected row
+    # count for every parquet comparison below.
+    complete = done_db + failed_db == total
 
-    order = {'done': 0, 'claimed': 1, 'pending': 2}
+    order = {'done': 0, 'failed': 1, 'claimed': 2, 'pending': 3}
     for status, n in sorted(rows, key=lambda r: order.get(r[0], 99)):
         sym = SYM_OK if (status == 'done' and complete) else SYM_NONE
+        if status == 'failed':
+            sym = SYM_WARN
         line(sym, status, f'{n}/{total}')
 
     try:

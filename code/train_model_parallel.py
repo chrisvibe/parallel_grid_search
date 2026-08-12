@@ -518,6 +518,17 @@ class LazyWorkerPool:
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
 
+    # Work-stealing tail protocol (multi-node).  A node that momentarily finds the
+    # queue empty must not retire for good: jobs return to 'pending' whenever a
+    # departing or dead node's claims are released, and somebody still running has to
+    # pick them up.  So a drained iterator is re-armed rather than latched, and the
+    # node lingers until the grid is actually finished.
+    REARM_DELAY_S = 15.0    # how often a drained node re-asks the DB for pending work
+    # Cap on lingering, so a stuck grid can't pin the allocation.  Must stay above
+    # GridSearchDB.HEARTBEAT_TIMEOUT_S (300 s): the main loop only sweeps dead nodes'
+    # claims on that interval, so a shorter grace would let every node give up before
+    # a single sweep had a chance to release the jobs they were waiting for.
+    IDLE_GRACE_S = 600.0
 
     def __init__(self, resource_manager: ComputeJobResourceManager, history: list, job_generator: JobGenerator, scheduler_loop_delay: int = .1, max_retries: int = 3, db: 'GridSearchDB | None' = None):
         self.resource_manager = resource_manager
@@ -526,6 +537,11 @@ class ResourceAwareScheduler:
         self.submission_complete = False
         self.scheduler_thread = None
         self.scheduler_loop_delay = scheduler_loop_delay
+
+        self._drained_at = 0.0            # when the generator last came up empty (0 = never)
+        self._idle_since = None           # when this node ran out of work to do
+        self._last_unfinished_check = 0.0
+        self._unfinished_cached = None    # last db.unfinished_count(), rate-limited
 
         # Worker pool — no manager needed
         def _make_can_spawn(device):
@@ -619,7 +635,12 @@ class ResourceAwareScheduler:
         # Wait for scheduler thread
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             self.scheduler_thread.join(timeout=5)
-        
+
+        # Hand back whatever this node claimed but will not finish, so peers can take it
+        # immediately rather than waiting out the heartbeat timeout — or, worse, reading
+        # it as live work and declining to compact.
+        self._release_unfinished_claims()
+
         # Shutdown worker pools
         for device, pool in self.worker_pools.items():
             pool.shutdown()
@@ -630,7 +651,78 @@ class ResourceAwareScheduler:
             p.join()
                 
         logger.info("Scheduler shutdown complete")
-        
+
+    def _release_unfinished_claims(self) -> None:
+        """Return every job this node holds but produced no result for.
+
+        Two sources: claimed into the generator's buffer but never dispatched, and
+        dispatched to a pool but never returned.  Jobs whose results are already in
+        _pending_marks were popped from in_flight on completion, so they are not
+        touched here — they get flushed and marked done after the scheduler stops.
+        """
+        try:
+            self.job_generator.release_buffered()
+        except Exception as e:
+            logger.warning(f"Could not release buffered claims: {e}")
+
+        if self.db is None:
+            return
+        with self._in_flight_lock:
+            orphans = list(self.in_flight.keys())
+        if not orphans:
+            return
+        try:
+            n = self.db.reset_to_pending(orphans)
+            if n:
+                logger.info(f"Released {n} in-flight jobs back to pending on shutdown")
+        except Exception as e:
+            logger.warning(f"Could not release in-flight claims: {e}")
+
+    def _ready_to_exit(self) -> bool:
+        """Whether this node may stop feeding and let the run wrap up.
+
+        Single-node mode: an exhausted generator means the whole grid is done.
+
+        Multi-node mode: draining the local queue says nothing about the grid.  Peers
+        may still be running, and jobs stranded by a node that already left have to be
+        re-claimed by whoever is still here.  Every node leaving at this point is what
+        produced the "all 8 nodes skip compaction, nobody writes the flag" deadlock, so
+        the node lingers instead — re-arming its iterator every REARM_DELAY_S — until
+        the grid is genuinely finished.  Bounded by IDLE_GRACE_S so a permanently stuck
+        grid cannot pin the allocation.
+        """
+        if self.db is None:
+            return True
+
+        now = time()
+        if now - self._last_unfinished_check >= self.REARM_DELAY_S:
+            try:
+                self._unfinished_cached = self.db.unfinished_count()
+            except Exception as e:
+                logger.warning(f"Could not read unfinished job count — exiting: {e}")
+                return True
+            self._last_unfinished_check = now
+
+        if self._unfinished_cached == 0:
+            return True
+
+        if self._idle_since is None:
+            self._idle_since = now
+            logger.info(
+                f"Local queue drained but {self._unfinished_cached} jobs remain in the grid — "
+                f"staying up to {self.IDLE_GRACE_S / 60:.0f} min to re-claim any that are released"
+            )
+            return False
+
+        waited = now - self._idle_since
+        if waited >= self.IDLE_GRACE_S:
+            logger.warning(
+                f"Waited {waited / 60:.1f} min with {self._unfinished_cached} jobs still "
+                f"unfinished — exiting; a peer or a re-run must finish them"
+            )
+            return True
+        return False
+
     def __enter__(self):
         return self
     
@@ -689,7 +781,10 @@ class ResourceAwareScheduler:
             logger.error(f"Job {i}-{j} permanently failed after {self.max_retries} retries: {reason}")
             self.permanently_failed.add(key)
             if self.db is not None:
-                self.db.mark_done_batch([(i, j)])  # advance to done so it doesn't block compaction
+                # STATUS_FAILED, not done: terminal (so it never blocks completion) but
+                # still distinguishable from a job that produced a parquet row, which is
+                # what lets compaction tell an explained gap from real data loss.
+                self.db.mark_failed([(i, j)])
             return
 
         logger.warning(f"Retrying job {i}-{j} (attempt {count}/{self.max_retries}): {reason}")
@@ -773,6 +868,15 @@ class ResourceAwareScheduler:
         if not self.running:
             return
 
+        # Re-arm a drained iterator so this node can still pick up jobs that return to
+        # 'pending' after a peer releases or loses its claims.  The generator's claim
+        # buffer lives on the JobGenerator instance, so replacing the iterator strands
+        # nothing.  Without this the first empty claim retires the node permanently.
+        if (self.submission_complete and self.db is not None
+                and time() - self._drained_at >= self.REARM_DELAY_S):
+            self._job_iter = iter(self.job_generator)
+            self.submission_complete = False
+
         # Back-pressure: when RAM is running low, let existing workers drain before
         # enqueueing more work. Still run _scale_pools for dead-worker cleanup.
         if self.resource_manager.is_memory_pressure_elevated():
@@ -821,6 +925,7 @@ class ResourceAwareScheduler:
                         job = next(self._job_iter)
                     except StopIteration:
                         self.submission_complete = True
+                        self._drained_at = time()
                         break
                 else:
                     break
@@ -979,12 +1084,14 @@ class ResourceAwareScheduler:
                     self._log_status()
                     self._last_status_time = _now
 
-                finished = self._completed_count + len(self.permanently_failed)
-                # In DB mode the node only runs a subset of jobs, so finished may never
-                # reach total_expected. Exit when all claimed jobs are done instead.
+                # In DB mode the node only runs a subset of jobs, so _completed_count
+                # never reaches total_expected — "nothing left to do here" is the local
+                # condition, and _ready_to_exit decides whether the *grid* is finished.
                 with self._in_flight_lock:
                     nothing_in_flight = not self.in_flight
-                if self.submission_complete and (finished >= self.total_expected or nothing_in_flight):
+                if not nothing_in_flight:
+                    self._idle_since = None  # actively working; restart the idle clock
+                elif self._drained_at > 0.0 and self._ready_to_exit():
                     logger.info("Scheduler loop exit condition met")
                     break
 
@@ -1196,8 +1303,13 @@ def _ensure_state_db(
     return db
 
 
-def _read_batch_files(data_dir: Path) -> tuple[list, list[Path]]:
-    """Read all Parquet files in data_dir for compaction. Returns (tables, pq_files).
+def _read_batch_files(data_dir: Path) -> tuple[list, list[Path], list[Path]]:
+    """Read all Parquet files in data_dir for compaction.
+
+    Returns (tables, pq_files, unreadable) — the third element names the files that
+    could not be parsed.  Callers must not treat a short row count as "explained"
+    while it is non-empty: an unreadable batch file is unwritten results, and
+    deleting it (as the post-compaction cleanup does) would destroy them for good.
 
     Includes data.parquet (previous partial compaction) so results whose original
     batch files were cleaned up after an earlier successful compaction are not lost.
@@ -1205,13 +1317,33 @@ def _read_batch_files(data_dir: Path) -> tuple[list, list[Path]]:
     fewer rows if a stale-cache-triggered re-compaction sees fewer batch files.
     """
     pq_files = sorted(data_dir.glob('*.parquet'))
-    tables = []
+    tables, unreadable = [], []
     for f in pq_files:
         try:
             tables.append(pq.read_table(f))
         except Exception as e:
-            logger.warning(f"Skipping unreadable batch file during compaction: {f.name}: {e}")
-    return tables, pq_files
+            logger.warning(f"Unreadable batch file during compaction: {f.name}: {e}")
+            unreadable.append(f)
+    return tables, pq_files, unreadable
+
+
+def _missing_result_pairs(data_dir: Path, total_configs: int, samples_per_config: int) -> set:
+    """(i,j) pairs of the full grid that have no readable row anywhere in data_dir.
+
+    Scans data.parquet and every batch file, so a result still sitting in an
+    uncompacted batch counts as present.  Used to repair state.db when jobs are
+    marked done but their rows never reached disk — without that repair a re-run
+    sees a fully-done DB, finds nothing to do, and the gap is permanent.
+    """
+    present = set()
+    for f in sorted(data_dir.glob('*.parquet')):
+        try:
+            t = pq.read_table(f, columns=['i', 'j'])
+            present.update(zip(t.column('i').to_pylist(), t.column('j').to_pylist()))
+        except Exception as e:
+            logger.warning(f"Unreadable while scanning for missing results: {f.name}: {e}")
+    full = {(i, j) for i in range(total_configs) for j in range(samples_per_config)}
+    return full - present
 
 
 def _dedup_and_write(df, data_dir: Path, n_files: int) -> int:
@@ -1246,8 +1378,13 @@ def _dedup_and_write(df, data_dir: Path, n_files: int) -> int:
     return len(df)
 
 
-def _compact_results(data_dir: Path, compact_transform=None) -> None:
+def _compact_results(data_dir: Path, compact_transform=None) -> tuple:
     """Merge all batch Parquet files in data/ into data/data.parquet.
+
+    Returns (n_written, unreadable) where n_written is the row count in
+    data.parquet (None if nothing was written) and unreadable lists batch files
+    that could not be parsed.  The caller needs both: a row count that falls short
+    is only safe to accept as final when nothing was unreadable.
 
     Skips any existing data.parquet (previous compaction) as input — it will be
     overwritten as the output. Deduplicates on (i,j) keeping the last occurrence,
@@ -1260,27 +1397,27 @@ def _compact_results(data_dir: Path, compact_transform=None) -> None:
 
     if not data_dir.is_dir():
         logger.warning("data/ directory not found — nothing to compact")
-        return
+        return None, []
 
-    tables, pq_files = _read_batch_files(data_dir)
+    tables, pq_files, unreadable = _read_batch_files(data_dir)
     if not pq_files:
         logger.warning("No Parquet files found in data/ — data.parquet not written")
-        return
+        return None, unreadable
     compacted = data_dir / RUN.compacted_file
     if pq_files == [compacted]:
         # Only data.parquet exists — nothing new to merge; return its current row count.
         try:
-            return pq.read_metadata(str(compacted)).num_rows
+            return pq.read_metadata(str(compacted)).num_rows, unreadable
         except Exception:
             pass  # fall through to full compaction if unreadable
     if not tables:
         logger.warning("All batch files were unreadable — data.parquet not written")
-        return
+        return None, unreadable
 
     df = pa.concat_tables(tables).to_pandas()
     if compact_transform is not None:
         df = compact_transform(df)
-    return _dedup_and_write(df, data_dir, len(pq_files))
+    return _dedup_and_write(df, data_dir, len(pq_files)), unreadable
 
 
 def generic_parallel_grid_search(
@@ -1437,7 +1574,13 @@ def generic_parallel_grid_search(
                     node_done = scheduler.completed_count + len(scheduler.permanently_failed)
                     elapsed_s = max(1.0, time() - start_time)
                     pbar.update(global_done, node_done, elapsed_s)
-                    thresh = 1 if scheduler._completed_count <= 1 else history_write_thresh
+                    # Flush immediately once this node has drained and has nothing
+                    # running: its unflushed results are exactly what keep the last
+                    # jobs sitting in 'claimed', and every node — including this one —
+                    # waits for that count to reach zero before anyone will compact.
+                    # Holding them back for a 1000-row batch stalls the whole grid.
+                    _tail = scheduler._drained_at > 0.0 and not scheduler.in_flight
+                    thresh = 1 if (scheduler._completed_count <= 1 or _tail) else history_write_thresh
                     write_history(thresh=thresh)
                     scheduler_finished = not scheduler.scheduler_thread.is_alive()
                     if scheduler_finished:
@@ -1460,13 +1603,22 @@ def generic_parallel_grid_search(
         # that finishes early sees claimed+done==total even though other nodes haven't
         # flushed yet, compacts with a partial row count, and exits — leaving a gap.
         _n_done   = _global_counts.get('done', 0)
+        _n_failed = _global_counts.get('failed', 0)
         _n_pending = _global_counts.get('pending', 0) + _global_counts.get('claimed', 0)
+        # Failed jobs are terminal and will never produce a parquet row, so a complete
+        # grid yields this many rows, not total_jobs.  Any shortfall below it is
+        # unexplained — real data loss, not an accounted-for gap.
+        _expected_rows = total_jobs - _n_failed
         if not compact:
             logger.info("Compaction disabled — results remain as batch files in data/")
         elif _n_pending > 0:
-            logger.info(
+            # Reaching here with work outstanding means _ready_to_exit gave up waiting
+            # (IDLE_GRACE_S), so there may be no peer left to hand off to.  Say so
+            # plainly rather than implying somebody else has it covered.
+            logger.warning(
                 f"Skipping compaction: {_n_done}/{total_jobs} results flushed, "
-                f"{_n_pending} jobs still in flight — another node will compact when complete"
+                f"{_n_pending} jobs still unfinished — a peer still running will compact, "
+                f"otherwise re-run this grid search to finish them"
             )
         else:
             if flag_path.exists():
@@ -1478,42 +1630,75 @@ def generic_parallel_grid_search(
                 # This node won the claim.  Heavy I/O runs outside any lock so other nodes'
                 # mark_done_batch / update_heartbeat calls are never blocked.
                 logger.info(f"All {total_jobs} jobs done — compacting results")
-                n_written = _compact_results(data_dir, compact_transform=compact_transform)
+                try:
+                    n_written, _unreadable = _compact_results(
+                        data_dir, compact_transform=compact_transform)
 
-                def _finish(flag_msg):
-                    if not flag_path.exists():
-                        flag_path.touch()
-                        logger.info(flag_msg)
-                    if flag_path.exists() and (data_dir / RUN.compacted_file).exists():
-                        _keep = {RUN.state_db, RUN.compacted_file}
-                        for f in data_dir.iterdir():
-                            if f.is_file() and f.name not in _keep:
-                                f.unlink(missing_ok=True)
-                        logger.info(f"Cleaned up batch files from {RUN.data_dir}/ (kept {RUN.state_db} + {RUN.compacted_file})")
+                    def _finish(flag_msg):
+                        if not flag_path.exists():
+                            flag_path.touch()
+                            logger.info(flag_msg)
+                        if flag_path.exists() and (data_dir / RUN.compacted_file).exists():
+                            _keep = {RUN.state_db, RUN.compacted_file}
+                            for f in data_dir.iterdir():
+                                if f.is_file() and f.name not in _keep:
+                                    f.unlink(missing_ok=True)
+                            logger.info(f"Cleaned up batch files from {RUN.data_dir}/ (kept {RUN.state_db} + {RUN.compacted_file})")
 
-                if n_written is None:
-                    logger.warning(
-                        "Compaction found no batch files — results not yet flushed by another node. "
-                        "Another node will compact when its results are written."
-                    )
-                elif n_written >= total_jobs:
-                    _finish(f"Wrote {RUN.completed_flag}")
-                else:
-                    n_gap = total_jobs - n_written
-                    if _n_pending == 0:
-                        # No in-flight jobs left — gap is permanently failed jobs
-                        # (marked done in state.db but produced no parquet result).
+                    if n_written is None:
                         logger.warning(
-                            f"{n_gap} permanently failed jobs have no parquet result "
-                            f"({n_written}/{total_jobs} rows written)"
+                            "Compaction found no batch files — results not yet flushed by another node. "
+                            "Another node will compact when its results are written."
                         )
-                        _finish(f"Wrote {RUN.completed_flag} (with {n_gap} failed jobs)")
+                    elif n_written >= _expected_rows:
+                        # Rows are unique on (i,j), so reaching the expected count means
+                        # full coverage — everything that could produce a row did, and the
+                        # batch files are now redundant.  True even if a file was
+                        # unreadable: its rows are already accounted for, and refusing
+                        # here would leave a complete grid permanently unflagged.
+                        if _unreadable:
+                            logger.warning(
+                                f"{len(_unreadable)} batch files were unreadable but all "
+                                f"{_expected_rows} expected rows are present — completing anyway"
+                            )
+                        if _n_failed:
+                            _finish(f"Wrote {RUN.completed_flag} (with {_n_failed} failed jobs)")
+                        else:
+                            _finish(f"Wrote {RUN.completed_flag}")
                     else:
-                        logger.info(
-                            f"Compacted {n_written}/{total_jobs} rows — flag deferred until "
-                            f"remaining batch files are flushed by in-flight nodes"
+                        # Nothing left to run, yet rows are missing that no failed job
+                        # accounts for.  This is data loss, not a finished grid: leave the
+                        # flag unwritten and the batch files in place so a re-run can
+                        # rebuild state.db from them and fill the gap.  Deleting them here
+                        # is what used to make the loss permanent.
+                        n_gap = _expected_rows - n_written
+                        logger.error(
+                            f"Refusing to write {RUN.completed_flag}: {n_written}/{_expected_rows} "
+                            f"rows written, {n_gap} unaccounted for"
+                            + (f" ({len(_unreadable)} unreadable batch files: "
+                               f"{', '.join(f.name for f in _unreadable[:5])})" if _unreadable else "")
+                            + ". Batch files kept."
                         )
-                db.release_compaction_claim()  # remove sentinel so future restarts can compact
+                        # Repair state.db so the re-run has something to do.  Every one
+                        # of these jobs is marked done, so without this the next run
+                        # finds zero pending, compacts, and lands right back here.
+                        try:
+                            _missing = _missing_result_pairs(
+                                data_dir, total_configs, samples_per_config)
+                            n_reset = db.reset_missing_results(sorted(_missing))
+                            logger.error(
+                                f"Reset {n_reset} jobs to pending — re-run this grid search "
+                                f"to fill the gap"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Could not reset the missing jobs to pending ({e}) — a re-run "
+                                f"will need data/{RUN.state_db} deleted to rebuild from data/"
+                            )
+                finally:
+                    # Always drop the sentinel, even if compaction raised — otherwise the
+                    # claim outlives this node and no future run can ever compact.
+                    db.release_compaction_claim()
             db.close()
 
         elapsed_time = time() - start_time
@@ -1525,5 +1710,9 @@ def generic_parallel_grid_search(
     finally:
         _hb_stop.set()              # signal heartbeat loop to exit
         _hb_thread.join(timeout=5)  # wait so it finishes any in-flight update_heartbeat before db.close()
+        try:
+            db.close()  # idempotent; the compaction path may already have closed it
+        except Exception as e:
+            logger.warning(f"Error closing state.db: {e}")
         signal.signal(signal.SIGTERM, prev_sigterm)
         signal.signal(signal.SIGINT, prev_sigint)
