@@ -9,12 +9,14 @@ Everything here is DB- and file-level, so it runs in a second without a cluster,
 a dataset, or a training step.
 """
 import sqlite3
+import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from project.parallel_grid_search.code.parallel_utils import (
+    COMPACT_SENTINEL,
     GridSearchDB,
     JobGenerator,
     JobInterface,
@@ -83,17 +85,34 @@ def test_failed_is_terminal_but_distinct_from_done(db, tmp_path):
     assert db.unfinished_count() == 3
 
 
-def test_count_live_nodes_ignores_the_compaction_sentinel(db):
-    """The sentinel shares the heartbeats table but is not a node doing work;
-    counting it would inflate the ETA's assumed parallelism."""
-    assert db.count_live_nodes() == 1, "never reports zero — this node is alive"
+def test_count_live_nodes_counts_held_work_not_registry_rows(tmp_path):
+    """Heartbeat rows outlive their process, one per node per run, so counting them
+    overstates an 8-node crew several times over and the ETA reads far too
+    optimistic.  Held claims track only the nodes actually consuming work."""
+    db = GridSearchDB.open(tmp_path / 'state.db', 2, 3, node_id='observer')
+    for ghost in ('hpc1_old', 'hpc2_older', 'hpc3_ancient'):
+        _beat(db, ghost, time.time() - 50_000)
 
-    db.update_heartbeat('nodeA')
-    db.update_heartbeat('nodeB')
-    assert db.count_live_nodes() == 2
+    assert db.count_live_nodes() == 1, "ghosts hold no work; never reports zero either"
 
+    peer = GridSearchDB.open(tmp_path / 'state.db', 2, 3, node_id='peer')
+    peer.claim_next_batch(3)
+    db.claim_next_batch(3)
+
+    assert db.count_live_nodes() == 2, "exactly the two nodes holding claims"
+    peer.close()
+
+
+def test_the_compaction_sentinel_is_never_a_node_nor_swept_away(db):
+    """The sentinel shares the heartbeats table but claims no jobs, and it never
+    beats — so the sweep must not mistake it for a dead node and delete it, which
+    would let a second node start compacting on top of the first."""
+    db.claim_next_batch(6)
     assert db.try_claim_compaction()
-    assert db.count_live_nodes() == 2, "sentinel must not be counted as a node"
+
+    assert db.count_live_nodes() == 1, "sentinel is not a node"
+    db.reset_stale_claimed(timeout_s=0)
+    assert COMPACT_SENTINEL in db._read_heartbeats()
 
 
 def test_unfinished_count_reaches_zero_only_when_nothing_is_left(db):
@@ -145,6 +164,174 @@ def test_release_buffered_hands_back_undispatched_claims(tmp_path):
 def test_release_buffered_is_safe_without_a_db(tmp_path):
     gen = JobGenerator(job_factory=_factory, total_configs=2, samples_per_config=3)
     assert gen.release_buffered() == 0
+
+
+# --------------------------------------------------------------------------
+# crash recovery and the heartbeats table
+#
+# Staleness compares one node's timestamp against another's, so the cluster's
+# clocks are assumed synchronised (SLURM requires this too).  A node that drifts
+# further than the timeout reclaims its peers' in-flight jobs — duplicating work
+# rather than losing it, since rows are unique on (i,j) — so the assumption is
+# checked at startup and reported rather than silently trusted.
+# --------------------------------------------------------------------------
+
+def _beat(db, node_id, value):
+    """Force a heartbeat timestamp, standing in for a peer this process can't run."""
+    with db._tx() as conn:
+        conn.execute("INSERT OR REPLACE INTO heartbeats (node_id, last_seen) VALUES (?, ?)",
+                     (node_id, value))
+
+
+def _two_nodes(tmp_path):
+    """An observer and a peer on one state.db, holding three jobs each."""
+    observer = GridSearchDB.open(tmp_path / 'state.db', 2, 3, node_id='observer')
+    peer = GridSearchDB.open(tmp_path / 'state.db', 2, 3, node_id='peer')
+    peer.claim_next_batch(3)
+    observer.claim_next_batch(3)
+    return observer, peer
+
+
+def test_a_peer_that_stops_beating_has_its_jobs_reclaimed(tmp_path):
+    """A crashed node's claims must come back, or the grid can never finish them."""
+    observer, peer = _two_nodes(tmp_path)
+    _beat(observer, 'peer', time.time() - 400)   # last beat well past the 300 s timeout
+
+    assert observer.reset_stale_claimed() == 3
+    assert observer.counts().get('pending') == 3
+    assert observer.counts().get('claimed') == 3, "a beating node keeps its work"
+    peer.close()
+
+
+def test_a_clean_exit_hands_its_claims_back_at_once(tmp_path):
+    """close() drops the heartbeat row, so a graceful shutdown needs no timeout wait."""
+    observer, peer = _two_nodes(tmp_path)
+    peer.close()
+
+    assert observer.reset_stale_claimed() == 3, "no row, no wait"
+
+
+def test_the_sweep_drops_the_rows_it_declares_dead(tmp_path):
+    """Otherwise every crashed node leaves a row behind for good and the table grows
+    by one row per node per run."""
+    observer, peer = _two_nodes(tmp_path)
+    _beat(observer, 'peer', time.time() - 400)
+
+    observer.reset_stale_claimed()
+
+    assert 'peer' not in observer._read_heartbeats()
+    assert 'observer' in observer._read_heartbeats(), "a live node's row survives"
+    peer.close()
+
+
+def test_a_skewed_node_stops_reclaiming_its_peers_work(tmp_path):
+    """The hpc9 failure: a node 78 min fast reads every healthy peer as long dead.
+
+    It must keep working and keep flushing — it just may not judge anyone.
+    """
+    observer, peer = _two_nodes(tmp_path)
+    skew = 78 * 60
+    _beat(observer, 'peer', time.time() - skew)
+    observer._measure_clock_offset()                       # baseline
+    _beat(observer, 'peer', time.time() - skew + 60)       # peer beats again: it is alive
+    observer._measure_clock_offset()                       # advance proves the skew
+
+    assert observer.is_clock_skewed()
+    assert observer.reset_stale_claimed() == 0, "a skewed node must not reclaim"
+    assert observer.counts().get('claimed') == 6, "the peer keeps its work"
+    peer.close()
+
+
+def test_one_bad_clock_cannot_drag_the_cluster_onto_its_own_time(tmp_path):
+    """Observed in production: with the newest beat as reference, the fastest clock
+    becomes the time authority.  One node 78 min ahead made all eight healthy nodes
+    measure themselves as behind, correct into the future, and bench themselves —
+    leaving nobody to reclaim crashed work.  The median lets the majority win.
+    """
+    healthy = GridSearchDB.open(tmp_path / 'state.db', 2, 3, node_id='healthy')
+    for n in range(7):
+        _beat(healthy, f'peer{n}', time.time() - 20)
+    _beat(healthy, 'skewed', time.time() + 78 * 60)      # the one bad clock
+    healthy._measure_clock_offset()
+    for n in range(7):                                   # the crew beats again
+        _beat(healthy, f'peer{n}', time.time())
+    _beat(healthy, 'skewed', time.time() + 78 * 60 + 60)
+    healthy._measure_clock_offset()
+
+    assert not healthy.is_clock_skewed(), "the majority is the reference, not the outlier"
+    assert healthy.reset_stale_claimed() == 0, "and it still sweeps normally"
+
+
+def test_a_dead_cluster_is_not_mistaken_for_skew(tmp_path):
+    """The trap in this design: an old peer timestamp reads identically whether our
+    clock is fast or that peer died.  Guessing 'skew' would disable crash recovery,
+    so an offset only counts once a beat has been watched to advance."""
+    observer, peer = _two_nodes(tmp_path)
+    _beat(observer, 'peer', time.time() - 4000)   # crashed long ago; never beats again
+    observer._measure_clock_offset()
+    observer._measure_clock_offset()              # look twice: nothing advances
+
+    assert not observer.is_clock_skewed(), "no advance, no proof — assume our clock is fine"
+    assert observer.reset_stale_claimed() == 3, "so the dead node's work still comes back"
+    peer.close()
+
+
+def test_a_skewed_node_writes_its_heartbeat_in_cluster_time(tmp_path):
+    """Otherwise a fast clock stamps its rows in the future and its own jobs stay
+    locked after a crash for as long as the skew lasts."""
+    observer, peer = _two_nodes(tmp_path)
+    skew = 78 * 60
+    _beat(observer, 'peer', time.time() - skew)
+    observer._measure_clock_offset()
+    _beat(observer, 'peer', time.time() - skew + 60)
+    observer._measure_clock_offset()
+
+    observer.update_heartbeat('observer')
+    written = observer._read_heartbeats()['observer']
+
+    assert abs(written - (time.time() - skew)) < 90, "written in the peers' time frame"
+    peer.close()
+
+
+def test_an_unskewed_node_writes_its_own_clock_untouched(tmp_path):
+    """Healthy clusters must behave exactly as before — no correction, no drift."""
+    observer, peer = _two_nodes(tmp_path)
+    _beat(observer, 'peer', time.time() - 5)
+    observer._measure_clock_offset()
+    _beat(observer, 'peer', time.time())
+    observer._measure_clock_offset()
+
+    assert not observer.is_clock_skewed()
+    observer.update_heartbeat('observer')
+
+    assert abs(observer._read_heartbeats()['observer'] - time.time()) < 5
+    peer.close()
+
+
+def test_clock_skew_is_reported_but_nothing_depends_on_it(tmp_path):
+    """The startup warning is the whole defence against the synchronised-clock
+    assumption being violated silently."""
+    observer = GridSearchDB.open(tmp_path / 'state.db', 2, 3, node_id='observer')
+    assert observer.clock_skew_s() is None, "nobody else has beaten yet"
+
+    _beat(observer, 'peer', time.time() - 78 * 60)
+    skew = observer.clock_skew_s()
+
+    assert skew is not None and 78 * 60 - 5 < skew < 78 * 60 + 5
+    observer.close()
+
+
+def test_the_reported_skew_matches_the_one_decisions_use(tmp_path):
+    """They must share a reference.  While the warning measured against the newest
+    beat and the sweep against the median, one skewed peer made every healthy node
+    log itself as 77 min behind — the opposite of the truth."""
+    healthy = GridSearchDB.open(tmp_path / 'state.db', 2, 3, node_id='healthy')
+    for n in range(7):
+        _beat(healthy, f'peer{n}', time.time())
+    _beat(healthy, 'skewed', time.time() + 78 * 60)
+
+    assert abs(healthy.clock_skew_s()) < 5, "the outlier must not set the reference"
+    healthy.close()
 
 
 # --------------------------------------------------------------------------

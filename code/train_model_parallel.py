@@ -1585,7 +1585,10 @@ def generic_parallel_grid_search(
             _initial_done = _initial.get('done', 0)
             with _GridSearchProgress(total=total_jobs, initial=_initial_done) as pbar:
                 _last_counts_t = 0.0
-                _last_stale_reset_t = 0.0
+                # Start the clock rather than sweeping at once: _ensure_state_db just
+                # ran a sweep seconds ago, and by the time this one is due the heartbeat
+                # thread has had several beats to establish whether our clock is skewed.
+                _last_stale_reset_t = time()
                 overall = _initial
                 _n_nodes = 1   # refreshed with the counts; scales this node's rate into an ETA
                 while not shutdown.is_set():
