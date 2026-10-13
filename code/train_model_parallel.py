@@ -1257,8 +1257,10 @@ def _ensure_state_db(
 ) -> 'GridSearchDB':
     """Thundering-herd protocol: exactly one node builds state.db, others wait.
 
-    If state.db already exists, opens it immediately (fast path) and resets any
-    claimed jobs from dead nodes (heartbeat-based crash recovery).  Otherwise,
+    If state.db already exists, opens it immediately (fast path) and hands back the
+    claims of nodes with no heartbeat row (a clean exit, or a node that vanished).
+    Claims whose heartbeat is merely old wait for the scheduler loop's sweep: this
+    node cannot yet tell its own clock skew from a dead peer.  Otherwise,
     races to atomically create BUILDING_LOCK.  The winner runs _reconstruct_state
     and removes the lock; losers wait, watching for the lock to disappear and
     state.db to appear.
@@ -1272,9 +1274,9 @@ def _ensure_state_db(
 
     if state_path.exists():
         db = GridSearchDB.open(state_path, total_configs, samples_per_config, node_id=node_id)
-        n_stale = db.reset_stale_claimed()
+        n_stale = db.reset_stale_claimed(by_age=False)
         if n_stale:
-            logger.warning(f"Reset {n_stale} stale claimed jobs from dead nodes")
+            logger.warning(f"Reset {n_stale} claimed jobs from nodes that left")
         _startup_counts = db.counts()
         logger.info(
             f"Loaded state.db: {_startup_counts.get('done', 0)}/{total_configs * samples_per_config} done, "
@@ -1586,8 +1588,9 @@ def generic_parallel_grid_search(
             with _GridSearchProgress(total=total_jobs, initial=_initial_done) as pbar:
                 _last_counts_t = 0.0
                 # Start the clock rather than sweeping at once: _ensure_state_db just
-                # ran a sweep seconds ago, and by the time this one is due the heartbeat
-                # thread has had several beats to establish whether our clock is skewed.
+                # handed back the leavers' claims, and by the time this sweep is due the
+                # heartbeat thread has had several beats to establish whether our clock is
+                # skewed, which the age test needs.
                 _last_stale_reset_t = time()
                 overall = _initial
                 _n_nodes = 1   # refreshed with the counts; scales this node's rate into an ETA

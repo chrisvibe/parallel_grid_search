@@ -378,53 +378,54 @@ class GridSearchDB:
         consensus = self._peer_consensus()
         return None if consensus is None else time.time() - consensus
 
-    def reset_stale_claimed(self, timeout_s: int | None = None) -> int:
+    def reset_stale_claimed(self, timeout_s: int | None = None, by_age: bool = True) -> int:
         """Reset claimed jobs whose node has stopped heartbeating back to pending.
 
         A job is stale when its node_id:
           - is NULL (shouldn't happen, but defensive),
           - has no heartbeat entry (node vanished, or exited cleanly — close() drops
             the row so a clean shutdown hands its work back at once), or
-          - has a heartbeat older than timeout_s seconds.
+          - has a heartbeat older than timeout_s seconds (by_age).
 
-        The dead nodes' heartbeat rows are dropped in the same transaction: they are
-        never written again, and a table that only grows leaves one row per node per
-        run behind forever.
+        The first two need no clock.  The age test compares a peer's timestamp with this
+        node's clock, so it is only as good as that clock: a skewed node reads every
+        healthy peer as long dead and would reclaim work that is still running.  It is
+        therefore skipped when this node has proven its clock disagrees with the cluster
+        (it keeps computing and flushing, and its correctly-clocked peers still judge),
+        and by the caller with by_age=False when the clock cannot be judged yet: a node
+        that has just opened the DB has not watched a peer's beat advance, so it cannot
+        tell its own skew from a dead peer (hpc9, 78 min fast, reset every live claim on
+        each config of a multi-config run: probe 2, 2026-10-13).
 
-        A node that has proven its own clock disagrees with the cluster does not sweep
-        at all: staleness here is one node's timestamp measured against another's, so a
-        skewed node reads every healthy peer as long dead and reclaims work that is
-        still running.  It keeps computing and flushing normally — it just loses the
-        right to declare anyone else dead, which its correctly-clocked peers still do.
+        The heartbeat rows the age test declares dead are dropped in the same
+        transaction: they are never written again, and a table that only grows leaves
+        one row per node per run behind forever.
 
         Returns the number of jobs reset.
         """
         if timeout_s is None:
             timeout_s = self.HEARTBEAT_TIMEOUT_S
-        if self.is_clock_skewed():
+        if by_age and self.is_clock_skewed():
             logger.warning(
-                f"Skipping stale-job sweep: this node's clock is {self._clock_offset / 60:+.0f} min "
-                f"off the cluster, which would make every healthy peer look dead. "
-                f"Peers with correct clocks still reclaim crashed nodes' work; fix NTP here."
+                f"Stale-job sweep without the age test: this node's clock is "
+                f"{self._clock_offset / 60:+.0f} min off the cluster, which would make every "
+                f"healthy peer look dead. Peers with correct clocks still reclaim crashed "
+                f"nodes' work; fix NTP here."
             )
-            return 0
+            by_age = False
+        aged = "SELECT node_id FROM heartbeats WHERE last_seen < strftime('%s','now') - ?"
         def _do():
             with self._tx() as conn:
                 n = conn.execute(
                     f"UPDATE jobs SET status={STATUS_PENDING}, node_id=NULL "
                     f"WHERE status={STATUS_CLAIMED} AND ("
-                    f"    node_id IS NULL"
-                    f"    OR node_id NOT IN (SELECT node_id FROM heartbeats)"
-                    f"    OR node_id IN (SELECT node_id FROM heartbeats"
-                    f"                  WHERE last_seen < strftime('%s','now') - ?)"
-                    f")",
-                    (timeout_s,),
+                    f"    node_id IS NULL OR node_id NOT IN (SELECT node_id FROM heartbeats)"
+                    + (f" OR node_id IN ({aged})" if by_age else "") + ")",
+                    (timeout_s,) if by_age else (),
                 ).rowcount
-                conn.execute(
-                    "DELETE FROM heartbeats "
-                    "WHERE last_seen < strftime('%s','now') - ? AND node_id != ?",
-                    (timeout_s, COMPACT_SENTINEL),   # the sentinel never beats; keep it
-                )
+                if by_age:
+                    conn.execute(f"DELETE FROM heartbeats WHERE node_id IN ({aged}) AND node_id != ?",
+                                 (timeout_s, COMPACT_SENTINEL))   # the sentinel never beats; keep it
                 return n
         return _db_retry(_do)
 

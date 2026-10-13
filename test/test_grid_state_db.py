@@ -239,6 +239,27 @@ def test_a_skewed_node_stops_reclaiming_its_peers_work(tmp_path):
     assert observer.is_clock_skewed()
     assert observer.reset_stale_claimed() == 0, "a skewed node must not reclaim"
     assert observer.counts().get('claimed') == 6, "the peer keeps its work"
+    leaver = GridSearchDB.open(tmp_path / 'state.db', 3, 3, node_id='leaver')
+    leaver.claim_next_batch(3)
+    leaver.close()
+    assert observer.reset_stale_claimed() == 3, "a leaver needs no clock: its claims still come back"
+    peer.close()
+
+
+def test_a_node_joining_a_config_reclaims_only_the_leavers(tmp_path):
+    """Probe 2, 2026-10-13: hpc9 (78 min fast) opened each next config's state.db and its
+    startup sweep, run before any beat could prove the skew, reset every live peer's
+    claims (c4: 254 jobs run twice; c8: 671 reset).  The opening sweep needs no clock:
+    it hands back the claims of nodes without a heartbeat row and nothing else."""
+    observer, peer = _two_nodes(tmp_path)
+    _beat(observer, 'peer', time.time() - 78 * 60)   # alive, but reads as dead to a fast clock
+    leaver = GridSearchDB.open(tmp_path / 'state.db', 3, 3, node_id='leaver')
+    leaver.claim_next_batch(3)
+    leaver.close()                                   # a clean exit drops its row
+
+    assert observer.reset_stale_claimed(by_age=False) == 3, "the leaver's claims come back"
+    assert observer.counts().get('claimed') == 6, "the old-looking peer keeps its work"
+    assert 'peer' in observer._read_heartbeats(), "and its row is not swept"
     peer.close()
 
 
