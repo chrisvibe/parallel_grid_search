@@ -617,7 +617,13 @@ class GridSearchDB:
 
 
 class JobInterface(ABC):
-    """Simple interface that all jobs must implement"""
+    """Simple interface that all jobs must implement.
+
+    Every parallel workload in this repo is a JobInterface job run by
+    generic_parallel_grid_search (local or fulla via submit_job): it brings multi-node
+    claims, resume, retries, memory-aware spawning and parquet output for free. Don't
+    hand-roll pools or sharding. Examples: BooleanReservoirJob (train + KQ/GR),
+    simple_example.py, the PI probes (path_integration/code/probes/common.run_probe_grid)."""
     
     def __init__(self, i: int, j: int, total_configs: int, total_samples: int, locks: dict):
         self.i = i
