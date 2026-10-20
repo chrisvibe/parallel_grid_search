@@ -141,25 +141,18 @@ class GridSearchDB:
         );
     """
 
-    # How long (seconds) without a heartbeat before a node is considered dead.
-    # Comparing one node's timestamp against another's assumes the cluster's clocks
-    # agree; they are NTP-synced and SLURM requires this too, but a node that drifts
-    # further than this will reclaim its peers' in-flight work.  clock_skew_s() warns
-    # at startup when that assumption is violated.
+    # How long (seconds) a node's heartbeat may stay unchanged, as watched by a peer,
+    # before the peer declares it dead.  Liveness is never read off a timestamp's age,
+    # so the cluster's clocks need not agree (hpc9 runs ~79 min fast).
     HEARTBEAT_TIMEOUT_S: int = 300   # 5 × 60-second heartbeat interval
-
-    # A proven clock disagreement above this disables this node's stale sweep.  Two
-    # heartbeat intervals: NTP-synced nodes never come close, while the sweep only
-    # starts making false accusations near (timeout - interval) = 240 s.
-    CLOCK_TOLERANCE_S: int = 2 * (HEARTBEAT_TIMEOUT_S // 5)
 
     def __init__(self, db_path: Path, node_id: str = ''):
         self.db_path = Path(db_path)
         self.node_id = node_id
         self._lock = threading.Lock()  # serialize cross-thread access to _conn
         self._closed = False
-        self._peer_beat: float | None = None    # newest peer heartbeat seen so far
-        self._clock_offset: float | None = None  # proven skew; None = not established
+        self._watched_beats: dict = {}  # node_id → (beat, monotonic time it took that value, changed since first sighting?)
+        self._watch_lock = threading.Lock()  # the main loop and the scheduler thread both watch
         for attempt in range(30):
             try:
                 conn = sqlite3.connect(str(db_path), timeout=60, check_same_thread=False,
@@ -273,62 +266,20 @@ class GridSearchDB:
             ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
-    def _measure_clock_offset(self) -> None:
-        """Re-estimate how far this node's clock runs ahead of the cluster's.
-
-        Only a heartbeat that *advanced* since our last look proves a peer is alive,
-        and only then does "our clock minus their timestamp" measure skew rather than
-        the age of a dead node's final beat.  The two readings are identical, and
-        treating a dead cluster as skew would disable crash recovery — so until
-        something advances the offset stays None and every caller behaves as if the
-        clocks agreed.
-
-        The reference is the MEDIAN peer heartbeat, never the newest.  Taking the
-        newest makes the fastest clock in the cluster the de facto time authority:
-        one node an hour ahead is the max, every healthy node then measures itself as
-        an hour behind, "corrects" into the future, and the whole cluster converges on
-        the broken clock with every node benched.  A median lets eight good clocks
-        outvote one bad one, which is how NTP picks a reference too.  Two nodes cannot
-        outvote each other, so a pair with one bad clock is not recoverable here.
-
-        Error is bounded by the delay between a peer's write and our next read, i.e.
-        one heartbeat interval, comfortably inside CLOCK_TOLERANCE_S.
-        """
-        consensus = self._peer_consensus()
-        if consensus is None:
-            return
-        if self._peer_beat is None:
-            self._peer_beat = consensus   # baseline: proves nothing on its own
-        elif consensus > self._peer_beat:
-            self._peer_beat = consensus
-            self._clock_offset = time.time() - consensus
-
     def update_heartbeat(self, node_id: str) -> None:
-        """Upsert a liveness timestamp for node_id.  Called every ~60 s by a daemon thread.
+        """Upsert a liveness stamp for node_id.  Called every ~60 s by a daemon thread.
 
-        The timestamp is written in cluster time rather than local time when this node
-        is known to be skewed, so peers can age it correctly.  Without that, a fast
-        clock stamps its rows in the future and this node's jobs stay locked after a
-        crash for as long as the skew lasts.
-
-        Correcting our own writes is safe in a way that correcting our *judgements*
-        would not be: a wrong estimate here costs at most our own claims, whereas
-        trusting it to age other nodes risks reclaiming the whole cluster's work.
+        Peers only check that the stamp *changes* (watch_claim_holders), so its value
+        need not agree with anyone else's clock.
         """
-        self._measure_clock_offset()
-        offset = self._clock_offset if self.is_clock_skewed() else 0.0
         def _do():
             with self._tx() as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO heartbeats (node_id, last_seen) "
-                    "VALUES (?, strftime('%s','now') - ?)",
-                    (node_id, offset),
+                    "VALUES (?, strftime('%s','now'))",
+                    (node_id,),
                 )
         _db_retry(_do)
-
-    def is_clock_skewed(self) -> bool:
-        """True once this node has *proven* its clock disagrees with the cluster."""
-        return self._clock_offset is not None and abs(self._clock_offset) > self.CLOCK_TOLERANCE_S
 
     def remove_heartbeat(self, node_id: str | None = None) -> None:
         """Delete a node's heartbeat row.  An absent row means 'left on purpose'.
@@ -352,82 +303,6 @@ class GridSearchDB:
                     "SELECT node_id, last_seen FROM heartbeats"
                 ).fetchall())
         return _db_retry(_read)
-
-    def _peer_consensus(self) -> float | None:
-        """Median heartbeat across peers — the cluster's time as far as we can see it.
-
-        Median rather than newest: one node an hour fast would otherwise define
-        cluster time for everybody.  None when no peer has written a heartbeat yet.
-        """
-        peers = sorted(v for k, v in self._read_heartbeats().items()
-                       if k not in (self.node_id, COMPACT_SENTINEL))
-        return peers[len(peers) // 2] if peers else None
-
-    def clock_skew_s(self) -> float | None:
-        """Seconds this node's clock reads ahead of the cluster's median heartbeat.
-
-        Diagnostic only; nothing branches on it.  A large magnitude means either that
-        this machine's clock disagrees with the rest of the cluster or that the peers
-        have genuinely been idle that long, and the two are indistinguishable here.
-
-        Shares _peer_consensus with _measure_clock_offset on purpose: while this
-        warning measured against the newest beat and the decision measured against the
-        median, one skewed node made every healthy node report itself as the skewed
-        one.  Returns None when no peer has written a heartbeat yet.
-        """
-        consensus = self._peer_consensus()
-        return None if consensus is None else time.time() - consensus
-
-    def reset_stale_claimed(self, timeout_s: int | None = None, by_age: bool = True) -> int:
-        """Reset claimed jobs whose node has stopped heartbeating back to pending.
-
-        A job is stale when its node_id:
-          - is NULL (shouldn't happen, but defensive),
-          - has no heartbeat entry (node vanished, or exited cleanly — close() drops
-            the row so a clean shutdown hands its work back at once), or
-          - has a heartbeat older than timeout_s seconds (by_age).
-
-        The first two need no clock.  The age test compares a peer's timestamp with this
-        node's clock, so it is only as good as that clock: a skewed node reads every
-        healthy peer as long dead and would reclaim work that is still running.  It is
-        therefore skipped when this node has proven its clock disagrees with the cluster
-        (it keeps computing and flushing, and its correctly-clocked peers still judge),
-        and by the caller with by_age=False when the clock cannot be judged yet: a node
-        that has just opened the DB has not watched a peer's beat advance, so it cannot
-        tell its own skew from a dead peer (hpc9, 78 min fast, reset every live claim on
-        each config of a multi-config run: probe 2, 2026-10-13).
-
-        The heartbeat rows the age test declares dead are dropped in the same
-        transaction: they are never written again, and a table that only grows leaves
-        one row per node per run behind forever.
-
-        Returns the number of jobs reset.
-        """
-        if timeout_s is None:
-            timeout_s = self.HEARTBEAT_TIMEOUT_S
-        if by_age and self.is_clock_skewed():
-            logger.warning(
-                f"Stale-job sweep without the age test: this node's clock is "
-                f"{self._clock_offset / 60:+.0f} min off the cluster, which would make every "
-                f"healthy peer look dead. Peers with correct clocks still reclaim crashed "
-                f"nodes' work; fix NTP here."
-            )
-            by_age = False
-        aged = "SELECT node_id FROM heartbeats WHERE last_seen < strftime('%s','now') - ?"
-        def _do():
-            with self._tx() as conn:
-                n = conn.execute(
-                    f"UPDATE jobs SET status={STATUS_PENDING}, node_id=NULL "
-                    f"WHERE status={STATUS_CLAIMED} AND ("
-                    f"    node_id IS NULL OR node_id NOT IN (SELECT node_id FROM heartbeats)"
-                    + (f" OR node_id IN ({aged})" if by_age else "") + ")",
-                    (timeout_s,) if by_age else (),
-                ).rowcount
-                if by_age:
-                    conn.execute(f"DELETE FROM heartbeats WHERE node_id IN ({aged}) AND node_id != ?",
-                                 (timeout_s, COMPACT_SENTINEL))   # the sentinel never beats; keep it
-                return n
-        return _db_retry(_do)
 
     def mark_done_batch(self, pairs: list) -> None:
         """Transition status 1→2 (claimed→done) for a batch of (i,j) pairs.
@@ -525,7 +400,7 @@ class GridSearchDB:
         outlive the process that wrote them, so a resumed grid accumulates one row per
         node per run and the count grows without bound.  Held claims track the nodes
         actually consuming work, which is what the rate needs — a dead node's claims
-        are handed back by reset_stale_claimed, and a node holding none adds nothing
+        are handed back by release_dead_holders, and a node holding none adds nothing
         to the rate.
 
         Never returns less than 1 — this node is by definition alive.
@@ -537,6 +412,81 @@ class GridSearchDB:
                 ).fetchone()
             return max(1, row[0])
         return _db_retry(_read)
+
+    def watch_claim_holders(self, timeout_s: int | None = None) -> dict:
+        """{node_id: 'alive' | 'dead' | 'unknown'} for every *other* node holding claims.
+
+        Clock-free, so a skewed node can judge too: liveness is read off whether a
+        holder's heartbeat changes while this node watches, timed on this node's own
+        monotonic clock.  Never compares two machines' timestamps.
+          alive    its heartbeat changed within the last timeout_s
+          dead     it has no heartbeat row (it left without releasing, or a NULL owner),
+                   or its row has not changed for timeout_s of watching
+          unknown  not watched long enough to tell — call again; within one heartbeat
+                   interval a live holder turns 'alive'
+        """
+        if timeout_s is None:
+            timeout_s = self.HEARTBEAT_TIMEOUT_S
+        def _read():
+            with self._lock:
+                return [r[0] for r in self._conn.execute(
+                    f"SELECT DISTINCT node_id FROM jobs WHERE status={STATUS_CLAIMED} "
+                    f"AND node_id IS NOT ?", (self.node_id,)
+                ).fetchall()]
+        # Read and judge under one lock: two threads interleaving their reads could
+        # otherwise feed an older beat in after a newer one.
+        with self._watch_lock:
+            holders = _db_retry(_read)
+            beats = self._read_heartbeats()
+            now = time.monotonic()
+            verdict = {}
+            for nid in holders:
+                beat = beats.get(nid)
+                if beat is None:
+                    verdict[nid] = 'dead'
+                    continue
+                seen = self._watched_beats.get(nid)
+                if seen is None or seen[0] != beat:
+                    # First sighting only starts the clock; a change proves life.
+                    self._watched_beats[nid] = (beat, now, seen is not None)
+                    verdict[nid] = 'unknown' if seen is None else 'alive'
+                    continue
+                _, changed_at, has_changed = seen
+                if now - changed_at >= timeout_s:
+                    verdict[nid] = 'dead'
+                else:
+                    verdict[nid] = 'alive' if has_changed else 'unknown'
+            return verdict
+
+    def release_claims_of(self, node_ids: list) -> int:
+        """Hand the claims of nodes judged dead back to pending, and drop their heartbeat
+        rows (never written again).  None in node_ids stands for ownerless claims.
+        Returns the number of jobs released."""
+        ids = [n for n in node_ids if n is not None]
+        marks = ','.join('?' * len(ids)) or 'NULL'
+        def _do():
+            with self._tx() as conn:
+                n = conn.execute(
+                    f"UPDATE jobs SET status={STATUS_PENDING}, node_id=NULL "
+                    f"WHERE status={STATUS_CLAIMED} AND (node_id IN ({marks})"
+                    + (" OR node_id IS NULL" if None in node_ids else "") + ")",
+                    ids,
+                ).rowcount
+                conn.execute(f"DELETE FROM heartbeats WHERE node_id IN ({marks})", ids)
+                return n
+        return _db_retry(_do)
+
+    def release_dead_holders(self, timeout_s: int | None = None) -> tuple[int, dict]:
+        """Hand the claims of every holder watch_claim_holders finds dead back to pending.
+
+        Returns (jobs released, the verdicts).  On a node's first look, only holders
+        without a heartbeat row are dead (close() drops the row), so a node joining a
+        grid frees the leavers' work at once, and a crashed node's only after watching
+        its heartbeat stand still for HEARTBEAT_TIMEOUT_S.
+        """
+        verdict = self.watch_claim_holders(timeout_s)
+        dead = [n for n, v in verdict.items() if v == 'dead']
+        return (self.release_claims_of(dead) if dead else 0), verdict
 
     def counts(self) -> dict:
         """Return {status_name: count} for all statuses present in the DB.
@@ -563,14 +513,6 @@ class GridSearchDB:
             # Beat once before this node can claim anything: a claim whose node has no
             # heartbeat row at all is reclaimable on sight, so the row must exist first.
             db.update_heartbeat(node_id)
-            skew = db.clock_skew_s()
-            if skew is not None and abs(skew) > cls.HEARTBEAT_TIMEOUT_S:
-                logger.warning(
-                    f"Clock check: this node reads {abs(skew) / 60:.0f} min "
-                    f"{'ahead of' if skew > 0 else 'behind'} the rest of the cluster "
-                    f"(or every peer has been idle that long). This node will stop "
-                    f"reclaiming other nodes' jobs until its clock agrees; fix NTP here."
-                )
         return db
 
     def try_claim_compaction(self) -> bool:
@@ -678,6 +620,10 @@ class JobGenerator:
     # Jobs claimed from the DB but not yet yielded.  An instance attribute rather than
     # a local so release_buffered() can hand them back if this node leaves — see there.
     _buffer: deque = dataclasses.field(default_factory=deque, repr=False)
+    # Jobs claimed per DB round-trip, capped at ResourceLimits.db_claim_batch_size.  The
+    # scheduler sizes it to its prefetch, so the buffer never holds more work than the
+    # queue it feeds; None claims the full cap.
+    claim_batch: int | None = None
 
     def __len__(self) -> int:
         return self.total_configs * self.samples_per_config
@@ -705,11 +651,11 @@ class JobGenerator:
             # Batch-claim jobs to amortize NFS SQLite lock acquisitions.
             # Without batching, filling a 96-job queue costs 96 round-trips;
             # with batch_size=32 it costs 3.
-            _BATCH = ResourceLimits.db_claim_batch_size
+            _CAP = ResourceLimits.db_claim_batch_size
             while True:
                 if not self._buffer:
                     try:
-                        batch = self.db.claim_next_batch(_BATCH)
+                        batch = self.db.claim_next_batch(max(1, min(self.claim_batch or _CAP, _CAP)))
                     except sqlite3.OperationalError as e:
                         # DB locked on NFS — brief sleep and retry WITHOUT propagating out
                         # of the generator (a propagated exception closes the generator,
@@ -802,6 +748,12 @@ class ResourceLimits:
 
     # Infrastructure
     db_claim_batch_size: int = 128
+    # Work a node keeps queued and buffered ahead of its workers, in seconds of each
+    # pool's throughput.  Enough to hide the feeder's refill and the claim round-trip.
+    # No more: queued work is claimed work, and at the grid's tail every claimed but
+    # unstarted job is one an idle peer could have run (final run 2026-10-16: hpc4
+    # alone held ~12 min of queue while the other nodes had nothing left).
+    prefetch_s: float = 30.0
     mem_cache_ttl_s: float = 0.5
     mem_estimate_update_interval_s: float = 5.0
     min_alive_for_estimate: int = 2

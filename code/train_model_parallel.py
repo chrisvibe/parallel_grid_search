@@ -1,5 +1,6 @@
 import collections
 import contextlib
+import math
 from pathlib import Path
 from time import sleep, time
 import queue
@@ -518,17 +519,11 @@ class LazyWorkerPool:
 class ResourceAwareScheduler:
     """Simplified scheduler with centralized resource management"""
 
-    # Work-stealing tail protocol (multi-node).  A node that momentarily finds the
-    # queue empty must not retire for good: jobs return to 'pending' whenever a
-    # departing or dead node's claims are released, and somebody still running has to
-    # pick them up.  So a drained iterator is re-armed rather than latched, and the
-    # node lingers until the grid is actually finished.
+    # Tail protocol (multi-node).  A node that finds nothing left to claim leaves as
+    # soon as every outstanding claim belongs to a live peer: those peers finish their
+    # own work, and the last one out compacts.  It stays only to take over the claims
+    # of a peer that died (see _ready_to_exit), so nobody idles waiting for live work.
     REARM_DELAY_S = 15.0    # how often a drained node re-asks the DB for pending work
-    # Cap on lingering, so a stuck grid can't pin the allocation.  Must stay above
-    # GridSearchDB.HEARTBEAT_TIMEOUT_S (300 s): the main loop only sweeps dead nodes'
-    # claims on that interval, so a shorter grace would let every node give up before
-    # a single sweep had a chance to release the jobs they were waiting for.
-    IDLE_GRACE_S = 600.0
 
     def __init__(self, resource_manager: ComputeJobResourceManager, history: list, job_generator: JobGenerator, scheduler_loop_delay: int = .1, max_retries: int = 3, db: 'GridSearchDB | None' = None):
         self.resource_manager = resource_manager
@@ -539,9 +534,8 @@ class ResourceAwareScheduler:
         self.scheduler_loop_delay = scheduler_loop_delay
 
         self._drained_at = 0.0            # when the generator last came up empty (0 = never)
-        self._idle_since = None           # when this node ran out of work to do
-        self._last_unfinished_check = 0.0
-        self._unfinished_cached = None    # last db.unfinished_count(), rate-limited
+        self._last_tail_check = 0.0       # rate limit for _ready_to_exit's DB reads
+        self._tail_logged = False         # "nothing left to claim" is said once
 
         # Worker pool — no manager needed
         def _make_can_spawn(device):
@@ -679,49 +673,49 @@ class ResourceAwareScheduler:
             logger.warning(f"Could not release in-flight claims: {e}")
 
     def _ready_to_exit(self) -> bool:
-        """Whether this node may stop feeding and let the run wrap up.
+        """Whether this drained node may stop and let the run wrap up.
 
         Single-node mode: an exhausted generator means the whole grid is done.
 
-        Multi-node mode: draining the local queue says nothing about the grid.  Peers
-        may still be running, and jobs stranded by a node that already left have to be
-        re-claimed by whoever is still here.  Every node leaving at this point is what
-        produced the "all 8 nodes skip compaction, nobody writes the flag" deadlock, so
-        the node lingers instead — re-arming its iterator every REARM_DELAY_S — until
-        the grid is genuinely finished.  Bounded by IDLE_GRACE_S so a permanently stuck
-        grid cannot pin the allocation.
+        Multi-node mode: leave once nothing is pending and every claim still out belongs
+        to a live peer.  Live peers finish and flush their own work, and whichever of
+        them flushes last sees nothing unfinished and compacts, so an idle node adds
+        nothing by staying.  The one thing it must not do is walk away from a dead
+        peer's claims: those are released here and re-claimed by the re-armed iterator.
+        Liveness is watched rather than read off timestamps (watch_claim_holders), so
+        a node with a skewed clock decides correctly too.  A dead holder found here
+        rather than by the main loop's sweep is the same verdict, just sooner.
+
+        If every node leaves and a live peer then crashes, its claims are stranded until
+        the grid is run again: a re-run joins state.db, watches the dead holder for
+        HEARTBEAT_TIMEOUT_S, releases its claims, finishes them and compacts.
         """
         if self.db is None:
             return True
 
         now = time()
-        if now - self._last_unfinished_check >= self.REARM_DELAY_S:
-            try:
-                self._unfinished_cached = self.db.unfinished_count()
-            except Exception as e:
-                logger.warning(f"Could not read unfinished job count — exiting: {e}")
-                return True
-            self._last_unfinished_check = now
-
-        if self._unfinished_cached == 0:
-            return True
-
-        if self._idle_since is None:
-            self._idle_since = now
-            logger.info(
-                f"Local queue drained but {self._unfinished_cached} jobs remain in the grid — "
-                f"staying up to {self.IDLE_GRACE_S / 60:.0f} min to re-claim any that are released"
-            )
+        if now - self._last_tail_check < self.REARM_DELAY_S:
             return False
-
-        waited = now - self._idle_since
-        if waited >= self.IDLE_GRACE_S:
-            logger.warning(
-                f"Waited {waited / 60:.1f} min with {self._unfinished_cached} jobs still "
-                f"unfinished — exiting; a peer or a re-run must finish them"
-            )
+        self._last_tail_check = now
+        try:
+            if self.db.counts().get('pending', 0):
+                return False          # the re-armed iterator will claim them
+            n, holders = self.db.release_dead_holders()
+            if n:
+                logger.warning(f"Reclaimed {n} jobs from dead nodes")
+                return False
+        except Exception as e:
+            logger.warning(f"Could not read the grid's tail state — exiting: {e}")
             return True
-        return False
+
+        waiting = [n for n, v in holders.items() if v == 'unknown']
+        if holders and not self._tail_logged:
+            self._tail_logged = True
+            logger.info(
+                f"Nothing left to claim; {len(holders)} peer(s) still hold claims"
+                + (f", confirming {len(waiting)} of them alive before leaving" if waiting else "")
+            )
+        return not waiting
 
     def __enter__(self):
         return self
@@ -858,8 +852,19 @@ class ResourceAwareScheduler:
                     )
                     self._retry_job(key, f'worker died ({device})')
     
+    def _prefetch(self, pool) -> int:
+        """Jobs to keep queued for pool: limits.prefetch_s of its throughput, between 1
+        and 2 × its concurrency.  1 until a completion has timed the jobs — assume they
+        are slow rather than hoard; for fast jobs the first one lands within seconds."""
+        limit = pool.current_concurrency_limit
+        t_job = self.resource_manager.bee_router._last_time.get(pool.device)
+        if t_job is None:
+            return 1
+        ahead = math.ceil(limit * self.resource_manager.limits.prefetch_s / max(t_job, 1e-3))
+        return max(1, min(2 * limit, ahead))
+
     def _feed_pools(self):
-        """Kanban fill: top up every pool queue to 2 * current_concurrency_limit.
+        """Kanban fill: top up every pool queue to its _prefetch.
 
         Pools are shuffled so no device starves the others when
         scheduler_job_queue runs low. _try_scale_up (called after filling)
@@ -914,8 +919,9 @@ class ResourceAwareScheduler:
             # Don't gate CPU queue filling on cpu_load — same reason as GPU: it starves
             # workers when all workers are busy and CPU is saturated by fast jobs.
 
-            target = 2 * pool.current_concurrency_limit
+            target = self._prefetch(pool)
             needed = min(max(0, target - pool.backlog), global_budget)
+            self.job_generator.claim_batch = target
 
             for _ in range(needed):
                 if self._retry_queue:
@@ -1088,10 +1094,8 @@ class ResourceAwareScheduler:
                 # never reaches total_expected — "nothing left to do here" is the local
                 # condition, and _ready_to_exit decides whether the *grid* is finished.
                 with self._in_flight_lock:
-                    nothing_in_flight = not self.in_flight
-                if not nothing_in_flight:
-                    self._idle_since = None  # actively working; restart the idle clock
-                elif self._drained_at > 0.0 and self._ready_to_exit():
+                    nothing_in_flight = not self.in_flight and not self._retry_queue
+                if nothing_in_flight and self._drained_at > 0.0 and self._ready_to_exit():
                     logger.info("Scheduler loop exit condition met")
                     break
 
@@ -1258,9 +1262,9 @@ def _ensure_state_db(
     """Thundering-herd protocol: exactly one node builds state.db, others wait.
 
     If state.db already exists, opens it immediately (fast path) and hands back the
-    claims of nodes with no heartbeat row (a clean exit, or a node that vanished).
-    Claims whose heartbeat is merely old wait for the scheduler loop's sweep: this
-    node cannot yet tell its own clock skew from a dead peer.  Otherwise,
+    claims of nodes with no heartbeat row (a clean exit).  Claims whose holder still
+    has a row wait for the main loop's sweep, which must first watch that heartbeat
+    stand still (GridSearchDB.watch_claim_holders).  Otherwise,
     races to atomically create BUILDING_LOCK.  The winner runs _reconstruct_state
     and removes the lock; losers wait, watching for the lock to disappear and
     state.db to appear.
@@ -1274,7 +1278,7 @@ def _ensure_state_db(
 
     if state_path.exists():
         db = GridSearchDB.open(state_path, total_configs, samples_per_config, node_id=node_id)
-        n_stale = db.reset_stale_claimed(by_age=False)
+        n_stale, _ = db.release_dead_holders()
         if n_stale:
             logger.warning(f"Reset {n_stale} claimed jobs from nodes that left")
         _startup_counts = db.counts()
@@ -1587,10 +1591,9 @@ def generic_parallel_grid_search(
             _initial_done = _initial.get('done', 0)
             with _GridSearchProgress(total=total_jobs, initial=_initial_done) as pbar:
                 _last_counts_t = 0.0
-                # Start the clock rather than sweeping at once: _ensure_state_db just
-                # handed back the leavers' claims, and by the time this sweep is due the
-                # heartbeat thread has had several beats to establish whether our clock is
-                # skewed, which the age test needs.
+                # Look at the claim holders' heartbeats once per beat interval: a live
+                # holder's changes between looks, a crashed one's stands still and is
+                # released after HEARTBEAT_TIMEOUT_S of looking.
                 _last_stale_reset_t = time()
                 overall = _initial
                 _n_nodes = 1   # refreshed with the counts; scales this node's rate into an ETA
@@ -1603,8 +1606,8 @@ def generic_parallel_grid_search(
                         except Exception as e:
                             logger.debug(f"Could not count live nodes for the ETA: {e}")
                         _last_counts_t = now_t
-                    if now_t - _last_stale_reset_t >= GridSearchDB.HEARTBEAT_TIMEOUT_S:
-                        n_stale = db.reset_stale_claimed()
+                    if now_t - _last_stale_reset_t >= _HEARTBEAT_INTERVAL_S:
+                        n_stale, _ = db.release_dead_holders()
                         if n_stale:
                             logger.warning(f"Reclaimed {n_stale} jobs from dead nodes")
                         _last_stale_reset_t = now_t
@@ -1612,12 +1615,12 @@ def generic_parallel_grid_search(
                     node_done = scheduler.completed_count + len(scheduler.permanently_failed)
                     elapsed_s = max(1.0, time() - start_time)
                     pbar.update(global_done, node_done, elapsed_s, _n_nodes)
-                    # Flush immediately once this node has drained and has nothing
-                    # running: its unflushed results are exactly what keep the last
-                    # jobs sitting in 'claimed', and every node — including this one —
-                    # waits for that count to reach zero before anyone will compact.
-                    # Holding them back for a 1000-row batch stalls the whole grid.
-                    _tail = scheduler._drained_at > 0.0 and not scheduler.in_flight
+                    # Flush every result as it lands once this node has drained.  An
+                    # unflushed result keeps its finished job 'claimed', and the tail
+                    # protocol reads claims as work in progress: final run 2026-10-16,
+                    # hpc4 sat on 943 finished results while its last ~12 min of queue
+                    # ran, and 14 idle nodes waited on them for nothing.
+                    _tail = scheduler._drained_at > 0.0
                     thresh = 1 if (scheduler._completed_count <= 1 or _tail) else history_write_thresh
                     write_history(thresh=thresh)
                     scheduler_finished = not scheduler.scheduler_thread.is_alive()
@@ -1650,13 +1653,12 @@ def generic_parallel_grid_search(
         if not compact:
             logger.info("Compaction disabled — results remain as batch files in data/")
         elif _n_pending > 0:
-            # Reaching here with work outstanding means _ready_to_exit gave up waiting
-            # (IDLE_GRACE_S), so there may be no peer left to hand off to.  Say so
-            # plainly rather than implying somebody else has it covered.
-            logger.warning(
-                f"Skipping compaction: {_n_done}/{total_jobs} results flushed, "
-                f"{_n_pending} jobs still unfinished — a peer still running will compact, "
-                f"otherwise re-run this grid search to finish them"
+            # Normal for every node but the last: the remaining claims belong to live
+            # peers (_ready_to_exit checked), and the last of them compacts.
+            logger.info(
+                f"Leaving compaction to the peers still running: {_n_done}/{total_jobs} "
+                f"results flushed, {_n_pending} jobs unfinished (if they never finish, "
+                f"re-run this grid search)"
             )
         else:
             if flag_path.exists():

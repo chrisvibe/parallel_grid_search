@@ -20,9 +20,17 @@ Jobs are identified by `(i, j)` — config index × sample index. Each node clai
 
 On restart, if `state.db` is missing it is atomically rebuilt by scanning `data/*.parquet` for completed `(i, j)` pairs. A file-based lock (`state.building.lock`) prevents duplicate reconstruction when multiple nodes restart simultaneously. The node that wins writes `state.db` and removes the lock; the others wait and then open the finished file.
 
+A node that dies mid-run leaves its jobs `claimed`. Every node writes a heartbeat to `state.db` once a minute, and every node watches the heartbeats of the other nodes holding claims. A holder whose heartbeat has not changed for `HEARTBEAT_TIMEOUT_S` (5 min, timed on the watcher's own clock) is dead, and its claims go back to `pending`. Liveness never compares timestamps across machines, so a node with a skewed clock cannot look dead. A node that exits cleanly deletes its heartbeat row, so anything it still holds is reclaimed at the next check, with no 5-min wait.
+
+To recover from a crash, either:
+- **Re-run the grid search.** If other nodes are still running, they take over the dead node's jobs. If none are, the new node watches the dead node's heartbeat for 5 min, then reclaims its jobs, finishes them and compacts.
+- **Run `reset_grid` first** (see below), then re-run. `state.db` is rebuilt from the batch Parquets, so unflushed jobs are pending at once, with no 5-min wait. Only do this when no node is running on that grid.
+
 ## Multi-node
 
 All nodes share `output_path` on NFS/Lustre. `state.db` uses DELETE journal mode (not WAL — WAL's shared-memory file is unreliable on network filesystems). The compaction step is protected by a SQLite `BEGIN IMMEDIATE` mutex so exactly one node writes `data/data.parquet`.
+
+**End of a run — last one out compacts.** Each node queues only about `ResourceLimits.prefetch_s` (30 s) of work ahead of its workers, so no node holds a long backlog at the end. Once nothing is left to claim, a node flushes each result as it finishes. When it has no jobs in flight it exits, as long as every other claim holder has a changing heartbeat. If one is dead, the node reclaims that node's jobs and keeps working. On exit, the node compacts if no jobs are pending or claimed; otherwise it leaves compaction to the nodes still running. If those nodes then die too, re-run the grid search to finish and compact.
 
 ## Usage
 
